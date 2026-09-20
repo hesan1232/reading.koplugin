@@ -177,6 +177,9 @@ function ReadingPlugin:init()
     -- 章节变化触发的进度上传：记录上次已上传的章节索引，避免同章内重复上传
     self._last_synced_chapter = nil
     
+    -- 用于管理当前正在运行的异步任务的句柄集合
+    self._async_handles = {}
+    
     if self.ui and self.ui.menu then
         self.ui.menu:registerToMainMenu(self)
     end
@@ -254,8 +257,16 @@ end
 function ReadingPlugin:_async_run(work_func, on_done, opts)
     -- 包装 on_done 以捕获回调异常（回调在 UI 线程执行，异常不应中断 UIManager）
     local safe_on_done = nil
+    local handle_id = tostring(os.clock()) .. "_" .. tostring(math.random(10000, 99999))
+    local self_ref = self
+    
     if on_done then
         safe_on_done = function(ok, result, err)
+            -- 任务完成后清理句柄引用
+            if self_ref._async_handles then
+                self_ref._async_handles[handle_id] = nil
+            end
+            
             local call_ok, call_err = xpcall(function()
                 on_done(ok, result, err)
             end, function(e) return tostring(e) end)
@@ -263,9 +274,20 @@ function ReadingPlugin:_async_run(work_func, on_done, opts)
                 Log.error("_async_run 回调异常: " .. call_err)
             end
         end
+    else
+        safe_on_done = function()
+            if self_ref._async_handles then
+                self_ref._async_handles[handle_id] = nil
+            end
+        end
     end
+    
     if Async and Async.run then
-        return Async.run(work_func, safe_on_done, opts)
+        local handle = Async.run(work_func, safe_on_done, opts)
+        if handle and self._async_handles then
+            self._async_handles[handle_id] = handle
+        end
+        return handle
     end
     -- 降级：scheduleIn 同步执行（UI 线程阻塞）
     opts = opts or {}
@@ -277,6 +299,38 @@ function ReadingPlugin:_async_run(work_func, on_done, opts)
         end
     end)
     return nil
+end
+
+--- 取消特定的异步任务或所有任务
+function ReadingPlugin:_cancel_async(handle_or_id)
+    if not self._async_handles then return end
+    
+    if handle_or_id == nil then
+        -- 取消所有任务
+        for id, handle in pairs(self._async_handles) do
+            if type(handle) == "table" and type(handle.cancel) == "function" then
+                pcall(handle.cancel)
+            end
+        end
+        self._async_handles = {}
+    elseif type(handle_or_id) == "string" then
+        -- 按 ID 取消
+        local handle = self._async_handles[handle_or_id]
+        if handle and type(handle) == "table" and type(handle.cancel) == "function" then
+            pcall(handle.cancel)
+            self._async_handles[handle_or_id] = nil
+        end
+    elseif type(handle_or_id) == "table" and type(handle_or_id.cancel) == "function" then
+        -- 直接通过句柄取消
+        pcall(handle_or_id.cancel)
+        -- 尝试从集合中移除
+        for id, h in pairs(self._async_handles) do
+            if h == handle_or_id then
+                self._async_handles[id] = nil
+                break
+            end
+        end
+    end
 end
 
 function ReadingPlugin:getSettingsMenuItems()
@@ -523,10 +577,6 @@ function ReadingPlugin:show_webdav_file_list()
     local self_ref = self
     self:_async_run(
         function()
-            local ok, __, err = sync_ref:test_webdav_connection()
-            if not ok then
-                return { ok = false, err = err or _("连接失败") }
-            end
             local ok2, items, err2 = sync_ref.webdav:list("")
             if not ok2 then
                 return { ok = false, err = err2 or _("列出文件失败") }
@@ -954,6 +1004,12 @@ function ReadingPlugin:download_epub_for_book(book, force_overwrite)
         return
     end
 
+    -- 取消之前的书籍下载任务，避免并发下载或回调混乱
+    if self._download_epub_handle then
+        self:_cancel_async(self._download_epub_handle)
+        self._download_epub_handle = nil
+    end
+
     self:showBusy(force_overwrite and _("正在更新书籍...") or _("正在下载书籍..."))
 
     local gen = Context.get_generation()
@@ -967,7 +1023,7 @@ function ReadingPlugin:download_epub_for_book(book, force_overwrite)
     local force_ref = force_overwrite
 
     -- 整个 list + match + download 流程在子进程中执行，UI 不阻塞
-    self:_async_run(
+    self._download_epub_handle = self:_async_run(
         function()
             local ok, epub_files, err = sync_ref:list_books_directory()
             if not ok then
@@ -985,6 +1041,7 @@ function ReadingPlugin:download_epub_for_book(book, force_overwrite)
             return { ok = true, save_path = save_path, result = result }
         end,
         function(ok, result, err)
+            self_ref._download_epub_handle = nil
             self_ref:closeBusy()
             if not ok then
                 Log.error("EPUB下载异步失败: " .. tostring(err))
@@ -1077,8 +1134,11 @@ function ReadingPlugin:_load_chapters_from_document(retry_count)
     if toc and #toc > 0 then
         Context.set_current_chapters({})
         for ___, entry in ipairs(toc) do
+            local title = entry.title or ""
             table.insert(Context.get_current_chapters(), {
-                name = entry.title or "",
+                name = title,
+                -- 预处理并缓存 normalize 后的标题，优化查找效率
+                norm_name = title:gsub("%s+", ""),
                 xpointer = entry.xpointer or "",
                 page = entry.page or 1,
             })
@@ -1668,12 +1728,14 @@ function ReadingPlugin:_refresh_current_progress()
     local chapter_index = #toc
     local chapter_pos = 1000
 
-    for i = 1, #toc do
-        local current_start = toc[i].page or 1
-        local next_start = (i < #toc) and (toc[i + 1].page or total_pages + 1) or (total_pages + 1)
+    local left, right = 1, #toc
+    while left <= right do
+        local mid = math.floor((left + right) / 2)
+        local current_start = toc[mid].page or 1
+        local next_start = (mid < #toc) and (toc[mid + 1].page or total_pages + 1) or (total_pages + 1)
 
         if current_page >= current_start and current_page < next_start then
-            chapter_index = i
+            chapter_index = mid
             local chapter_pages = next_start - current_start
             if chapter_pages > 0 then
                 chapter_pos = math.floor((current_page - current_start) / chapter_pages * 1000)
@@ -1687,6 +1749,10 @@ function ReadingPlugin:_refresh_current_progress()
                 chapter_title = toc[chapter_index] and toc[chapter_index].title or "",
             })
             break
+        elseif current_page < current_start then
+            right = mid - 1
+        else
+            left = mid + 1
         end
     end
 
@@ -1923,7 +1989,7 @@ function ReadingPlugin:_find_chapter_by_title(chapters, title)
     if not chapters or #chapters == 0 then return nil end
     if not title or title == "" then return nil end
 
-    -- 兼容 EPUB TOC（title 字段）和 Legado 章节列表（name/title 字段）
+    -- 兼容 EPUB TOC（title/norm_name 字段）和 Legado 章节列表（name/title 字段）
     local get_name = function(ch)
         return ch and (ch.name or ch.title) or ""
     end
@@ -1937,13 +2003,17 @@ function ReadingPlugin:_find_chapter_by_title(chapters, title)
     end
 
     -- 2. 去空格匹配（标题可能因 EPUB/Legado 解析差异导致空格不同）
-    local normalize = function(s)
-        return s and s:gsub("%s+", "") or ""
-    end
-    local norm_title = normalize(title)
+    local norm_title = title:gsub("%s+", "")
     if norm_title ~= "" then
         for i, ch in ipairs(chapters) do
-            if normalize(get_name(ch)) == norm_title then
+            -- 如果有预处理好的 norm_name，直接使用，否则实时计算并缓存
+            local ch_norm = ch.norm_name
+            if not ch_norm then
+                ch_norm = get_name(ch):gsub("%s+", "")
+                ch.norm_name = ch_norm
+            end
+            
+            if ch_norm == norm_title then
                 Log.debug("_find_chapter_by_title: 去空格匹配: '" .. title .. "' -> 第" .. i .. "章 (" .. get_name(ch) .. ")")
                 return i
             end
@@ -1951,7 +2021,12 @@ function ReadingPlugin:_find_chapter_by_title(chapters, title)
 
         -- 3. 子串匹配（一方包含另一方，处理标题前后缀差异）
         for i, ch in ipairs(chapters) do
-            local norm_ch = normalize(get_name(ch))
+            local norm_ch = ch.norm_name
+            if not norm_ch then
+                norm_ch = get_name(ch):gsub("%s+", "")
+                ch.norm_name = norm_ch
+            end
+            
             if norm_ch ~= "" and (norm_ch:find(norm_title, 1, true) or norm_title:find(norm_ch, 1, true)) then
                 Log.debug("_find_chapter_by_title: 子串匹配: '" .. title .. "' -> 第" .. i .. "章 (" .. get_name(ch) .. ")")
                 return i
@@ -2258,6 +2333,9 @@ function ReadingPlugin:view_log()
 end
 
 function ReadingPlugin:onClose()
+    -- 清理所有未完成的异步任务，防止插件关闭后回调仍被触发
+    self:_cancel_async()
+    
     -- 一次性关闭所有 UI 句柄（含 menu、detail_dialog、active_menu、busy_msg、chapter_list_menu）
     -- 修复原 _state 中 current_chapter_list_menu 在 onClose 未被清理的泄漏 bug
     UIHandles.close_all()
@@ -2380,13 +2458,15 @@ function ReadingPlugin:onPageUpdate(pageno)
             local chapter_pos = 1000
             local chapter_title = ""
 
-            for i = 1, #toc do
-                local current_start = toc[i].page or 1
-                local next_start = (i < #toc) and (toc[i + 1].page or total_pages + 1) or (total_pages + 1)
+            local left, right = 1, #toc
+            while left <= right do
+                local mid = math.floor((left + right) / 2)
+                local current_start = toc[mid].page or 1
+                local next_start = (mid < #toc) and (toc[mid + 1].page or total_pages + 1) or (total_pages + 1)
 
                 if pageno >= current_start and pageno < next_start then
-                    chapter_index = i
-                    chapter_title = toc[i] and toc[i].title or ""
+                    chapter_index = mid
+                    chapter_title = toc[mid] and toc[mid].title or ""
                     local chapter_pages = next_start - current_start
                     if chapter_pages > 0 then
                         chapter_pos = math.floor((pageno - current_start) / chapter_pages * 1000)
@@ -2402,6 +2482,10 @@ function ReadingPlugin:onPageUpdate(pageno)
                         chapter_title = chapter_title,
                     })
                     break
+                elseif pageno < current_start then
+                    right = mid - 1
+                else
+                    left = mid + 1
                 end
             end
 

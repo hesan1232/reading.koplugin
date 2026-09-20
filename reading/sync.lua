@@ -71,15 +71,10 @@ function Sync:parse_backup(data)
     
     local files = {}
     
-    local lines = {}
-    for line in data:gmatch("[^\n]+") do
-        table.insert(lines, line)
-    end
-    
     local current_file = nil
     local current_content = {}
     
-    for _, line in ipairs(lines) do
+    for line in data:gmatch("[^\n]+") do
         local trimmed_line = line:gsub("^%s+", ""):gsub("%s+$", "")
         
         local start_pos = trimmed_line:find("^%-%-%-")
@@ -425,11 +420,11 @@ function Sync:download_all_book_progress()
 end
 
 function Sync:_normalize_file_name(name)
-    local normalized = name:gsub("[\\/:*?\"<>|]", "_")
-    normalized = normalized:gsub("_+", "_")
-    normalized = normalized:gsub("^_", "")
-    normalized = normalized:gsub("_$", "")
-    return normalized
+    -- 将特殊字符替换为 "_"，并将连续的 "_" 合并为一个，同时去除首尾的 "_"
+    return name:gsub("[\\/:*?\"<>|]", "_")
+               :gsub("_+", "_")
+               :gsub("^_", "")
+               :gsub("_$", "")
 end
 
 function Sync:upload_book_progress(book_name, book_author, chapter_index, chapter_pos, chapter_title)
@@ -508,12 +503,6 @@ function Sync:download_epub(epub_path, save_path, force_overwrite, remote_size, 
         return true, save_path, "skipped"
     end
     
-    local ok, content, err = self.webdav:get_file(epub_path, progress_callback, remote_size)
-    if not ok then
-        Log.error("下载EPUB失败: " .. tostring(err))
-        return false, nil, err
-    end
-    
     local books_dir = H.get_books_dir()
     H.make_dir(books_dir)
     
@@ -523,8 +512,16 @@ function Sync:download_epub(epub_path, save_path, force_overwrite, remote_size, 
         return false, nil, "无法打开文件"
     end
     
-    file:write(content)
+    local ok, content, err = self.webdav:get_file(epub_path, progress_callback, remote_size, file)
+    
     file:close()
+    
+    if not ok then
+        Log.error("下载EPUB失败: " .. tostring(err))
+        -- 下载失败时删除可能不完整的文件
+        os.remove(save_path)
+        return false, nil, err
+    end
     
     Log.info("EPUB下载成功: " .. save_path)
     return true, save_path, "downloaded"
@@ -603,13 +600,6 @@ end
 function Sync:sync_from_webdav()
     Log.info("开始从WebDAV同步")
     
-    local ok, __, err = self.webdav:test_connection()
-    if not ok then
-        return false, nil, "WebDAV连接失败: " .. tostring(err)
-    end
-    
-    Log.info("WebDAV连接成功")
-    
     local ok2, content, filename = self.webdav:get_backup_file()
     if not ok2 then
         Log.error("获取备份文件失败: " .. tostring(filename))
@@ -667,11 +657,6 @@ end
 function Sync:upload_to_webdav(book_url)
     Log.info("上传进度到WebDAV")
     
-    local ok, __, err = self.webdav:test_connection()
-    if not ok then
-        return false, nil, "WebDAV连接失败: " .. tostring(err)
-    end
-    
     local records = {}
     if book_url then
         for _, record in ipairs(self.read_records) do
@@ -704,11 +689,6 @@ end
 function Sync:upload_full_backup()
     Log.info("上传完整备份到WebDAV")
     
-    local ok, __, err = self.webdav:test_connection()
-    if not ok then
-        return false, nil, "WebDAV连接失败: " .. tostring(err)
-    end
-    
     local backup_data = {
         bookshelf = self.bookshelf,
         readRecord = self.read_records,
@@ -730,11 +710,6 @@ end
 
 function Sync:upload_read_record(record)
     Log.info("上传单条阅读记录")
-    
-    local ok, __, err = self.webdav:test_connection()
-    if not ok then
-        return false, nil, "WebDAV连接失败: " .. tostring(err)
-    end
     
     local json_data = H.json_encode(record)
     if not json_data then

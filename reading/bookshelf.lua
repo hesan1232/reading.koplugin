@@ -10,9 +10,12 @@ function Bookshelf:new(settings)
         books = {},
         cache = {},
         name_index = {},      -- 书名 -> book 哈希索引，O(1) 查找
+        url_index = {},       -- bookUrl -> book 哈希索引，O(1) 查找
         epub_cache = nil,     -- 本地 EPUB 文件列表缓存
         epub_cache_dirty = true,
         sorted = false,
+        toc_cache_mem = {},   -- TOC 内存缓存，避免频繁读盘
+        bookshelf_cache_mtime = 0, -- 书架缓存文件的最后修改时间，避免重复加载
     }
     return setmetatable(obj, self)
 end
@@ -37,13 +40,17 @@ function Bookshelf:apply_sync_data(data)
     Log.info("加载完成: " .. #self.books .. " 本书")
 end
 
---- 重建书名索引，用于 O(1) 查找
+--- 重建书名和URL索引，用于 O(1) 查找
 function Bookshelf:rebuild_index()
     self.name_index = {}
+    self.url_index = {}
     for _, book in ipairs(self.books) do
         local name = book.name or book.title or ""
         if name ~= "" then
             self.name_index[name:lower()] = book
+        end
+        if book.bookUrl and book.bookUrl ~= "" then
+            self.url_index[book.bookUrl] = book
         end
     end
 end
@@ -61,24 +68,34 @@ function Bookshelf:sort_books()
     
     Log.debug("排序方式: " .. sort_order)
     
-    table.sort(self.books, function(a, b)
-        if sort_order == "last_read" then
+    local sort_func
+    if sort_order == "last_read" then
+        sort_func = function(a, b)
             local time_a = a.durChapterTime or a.lastCheckTime or 0
             local time_b = b.durChapterTime or b.lastCheckTime or 0
             return time_a > time_b
-        elseif sort_order == "progress" then
+        end
+    elseif sort_order == "progress" then
+        sort_func = function(a, b)
             local progress_a = (a.durChapterIndex or 0) / (a.totalChapterNum or 1)
             local progress_b = (b.durChapterIndex or 0) / (b.totalChapterNum or 1)
             return progress_a < progress_b
-        elseif sort_order == "title" then
+        end
+    elseif sort_order == "title" then
+        sort_func = function(a, b)
             return (a.name or a.title or "") < (b.name or b.title or "")
-        elseif sort_order == "added" then
+        end
+    elseif sort_order == "added" then
+        sort_func = function(a, b)
             local time_a = a.lastCheckTime or a.durChapterTime or 0
             local time_b = b.lastCheckTime or b.durChapterTime or 0
             return time_a > time_b
         end
-        return true
-    end)
+    else
+        sort_func = function(a, b) return true end
+    end
+    
+    table.sort(self.books, sort_func)
     self.sorted = true
 end
 
@@ -87,12 +104,8 @@ function Bookshelf:get_books()
 end
 
 function Bookshelf:get_book_by_url(book_url)
-    for _, book in ipairs(self.books) do
-        if book.bookUrl == book_url then
-            return book
-        end
-    end
-    return nil
+    if not book_url or book_url == "" then return nil end
+    return self.url_index[book_url]
 end
 
 function Bookshelf:_normalize_url(url)
@@ -183,6 +196,7 @@ function Bookshelf:save_toc_cache(book_url, chapters)
         if file then
             file:write(json_data)
             file:close()
+            self.toc_cache_mem[book_url] = chapters
             Log.debug("保存目录缓存: " .. book_url)
             return true
         end
@@ -192,6 +206,10 @@ function Bookshelf:save_toc_cache(book_url, chapters)
 end
 
 function Bookshelf:load_toc_cache(book_url)
+    if self.toc_cache_mem[book_url] then
+        return self.toc_cache_mem[book_url]
+    end
+
     local toc_dir = H.get_toc_dir()
     local file_path = H.join_path(toc_dir, H.url_encode(book_url) .. ".json")
     
@@ -207,6 +225,7 @@ function Bookshelf:load_toc_cache(book_url)
         local data = H.json_decode(content)
         if data and data.chapters then
             Log.debug("加载目录缓存: " .. book_url)
+            self.toc_cache_mem[book_url] = data.chapters
             return data.chapters
         end
     end
@@ -215,6 +234,7 @@ function Bookshelf:load_toc_cache(book_url)
 end
 
 function Bookshelf:clear_toc_cache(book_url)
+    self.toc_cache_mem[book_url] = nil
     local toc_dir = H.get_toc_dir()
     local file_path = H.join_path(toc_dir, H.url_encode(book_url) .. ".json")
     H.delete_file(file_path)
@@ -523,6 +543,9 @@ function Bookshelf:save_bookshelf_cache(books)
             file:close()
             local ok, err = os.rename(tmp_path, file_path)
             if ok then
+                local lfs = require("libs/libkoreader-lfs")
+                local attr = lfs.attributes(file_path)
+                if attr then self.bookshelf_cache_mtime = attr.modification or 0 end
                 Log.info("保存书架缓存: " .. #books .. " 本书")
                 return true
             else
@@ -543,6 +566,15 @@ function Bookshelf:load_bookshelf_cache()
     if not H.file_exists(file_path) then
         Log.info("书架缓存文件不存在: " .. file_path)
         return nil
+    end
+
+    local lfs = require("libs/libkoreader-lfs")
+    local attr = lfs.attributes(file_path)
+    local current_mtime = attr and attr.modification or 0
+    
+    if current_mtime > 0 and current_mtime == self.bookshelf_cache_mtime and self.books and #self.books > 0 then
+        Log.debug("书架缓存文件未修改，直接返回内存数据")
+        return self.books
     end
 
     local file = io.open(file_path, "r")
@@ -577,6 +609,7 @@ function Bookshelf:load_bookshelf_cache()
 
     self.books = data.books
     self.sorted = false
+    self.bookshelf_cache_mtime = current_mtime
     self:rebuild_index()
     self:invalidate_epub_cache()
     return data.books

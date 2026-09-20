@@ -95,7 +95,7 @@ end
 --- @return handle|nil  返回句柄 { cancel=fn, pid=... }；降级同步时返回 nil
 function Async.run(work_func, on_done, opts)
     opts = opts or {}
-    local poll_interval = opts.poll_interval or 0.125
+    local poll_interval = opts.poll_interval or 0.05
     local timeout = opts.timeout or 60
     local delay = opts.delay or 0
 

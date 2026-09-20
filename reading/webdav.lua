@@ -181,7 +181,7 @@ function WebDAV:_list_impl(path)
     local password = self:_get_password()
 
     local code, status, sink = self:_request_with_retry("list " .. tostring(path), function()
-        socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
+        socketutil:set_timeout(15, socketutil.FILE_TOTAL_TIMEOUT)
         local s = {}
         local c, h, st = socket.skip(1, transport.request({
             url      = url,
@@ -282,9 +282,9 @@ function WebDAV:_list_impl(path)
     return true, item_list
 end
 
-function WebDAV:get_file(path, progress_callback, total_size)
+function WebDAV:get_file(path, progress_callback, total_size, file_handle)
     local ok, r1, r2 = xpcall(function()
-        return self:_get_file_impl(path, progress_callback, total_size)
+        return self:_get_file_impl(path, progress_callback, total_size, file_handle)
     end, function(err) return tostring(err) end)
     if not ok then
         local err = Result.format_error(r1)
@@ -298,7 +298,7 @@ function WebDAV:get_file(path, progress_callback, total_size)
     end
 end
 
-function WebDAV:_get_file_impl(path, progress_callback, total_size)
+function WebDAV:_get_file_impl(path, progress_callback, total_size, file_handle)
     local url = self:_build_url(path)
     Log.debug("获取文件: " .. url)
 
@@ -312,23 +312,49 @@ function WebDAV:_get_file_impl(path, progress_callback, total_size)
 
     -- 每次重试都重新构建 sink 与计数器，避免上次失败留下的半下载数据污染结果
     local code, status, sink = self:_request_with_retry("get " .. tostring(path), function()
-        socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
+        socketutil:set_timeout(15, socketutil.FILE_TOTAL_TIMEOUT)
         local s = {}
         local bytes_downloaded = 0
-        local custom_sink
-        if progress_callback then
-            custom_sink = ltn12.sink.callback(function(chunk, err)
-                if err then return nil, err end
-                if chunk then
+        
+        -- 如果重试，且有文件句柄，需要重置文件指针
+        if file_handle then
+            file_handle:seek("set", 0)
+        end
+
+        local last_check_time = os.time()
+        local last_check_bytes = 0
+        local STALL_TIMEOUT = 15
+        local MIN_RATE = 1024 -- 1KB/s
+
+        local custom_sink = ltn12.sink.callback(function(chunk, err)
+            if err then return nil, err end
+            if chunk then
+                bytes_downloaded = bytes_downloaded + #chunk
+                
+                -- 速率检测：连续 N 秒下载速率低于 1KB/s 则主动抛出异常，触发重试
+                local current_time = os.time()
+                if current_time - last_check_time >= STALL_TIMEOUT then
+                    local rate = (bytes_downloaded - last_check_bytes) / (current_time - last_check_time)
+                    if rate < MIN_RATE then
+                        return nil, "download_stalled"
+                    end
+                    last_check_time = current_time
+                    last_check_bytes = bytes_downloaded
+                end
+
+                if file_handle then
+                    file_handle:write(chunk)
+                else
                     table.insert(s, chunk)
-                    bytes_downloaded = bytes_downloaded + #chunk
+                end
+                
+                if progress_callback then
                     progress_callback(bytes_downloaded, total_size)
                 end
-                return true
-            end)
-        else
-            custom_sink = ltn12.sink.table(s)
-        end
+            end
+            return true
+        end)
+
         local c, h, st = socket.skip(1, transport.request({
             url      = url,
             method   = "GET",
@@ -355,9 +381,14 @@ function WebDAV:_get_file_impl(path, progress_callback, total_size)
         return false, "下载失败 (HTTP " .. code .. ")"
     end
 
-    local content = table.concat(sink)
-    Log.info("获取文件成功，大小: " .. #content)
-    return true, content
+    if file_handle then
+        Log.info("获取文件成功，流式写入完成")
+        return true, nil
+    else
+        local content = table.concat(sink)
+        Log.info("获取文件成功，大小: " .. #content)
+        return true, content
+    end
 end
 
 function WebDAV:put_file(path, content)
@@ -389,7 +420,7 @@ function WebDAV:_put_file_impl(path, content)
     local password = self:_get_password()
 
     local code, status = self:_request_with_retry("put " .. tostring(path), function()
-        socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
+        socketutil:set_timeout(15, socketutil.FILE_TOTAL_TIMEOUT)
         local c, h, st = socket.skip(1, transport.request({
             url      = url,
             method   = "PUT",
@@ -442,7 +473,7 @@ function WebDAV:_delete_file_impl(path)
     local password = self:_get_password()
 
     local code, status = self:_request_with_retry("delete " .. tostring(path), function()
-        socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
+        socketutil:set_timeout(15, socketutil.FILE_TOTAL_TIMEOUT)
         local c, h, st = socket.skip(1, transport.request({
             url      = url,
             method   = "DELETE",
@@ -491,7 +522,7 @@ function WebDAV:_mkdir_impl(path)
     local password = self:_get_password()
 
     local code, status = self:_request_with_retry("mkdir " .. tostring(path), function()
-        socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
+        socketutil:set_timeout(15, socketutil.FILE_TOTAL_TIMEOUT)
         local c, h, st = socket.skip(1, transport.request({
             url      = url,
             method   = "MKCOL",
@@ -574,7 +605,7 @@ function WebDAV:_test_connection_impl()
     local password = self:_get_password()
 
     local code, status = self:_request_with_retry("test_connection", function()
-        socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
+        socketutil:set_timeout(15, socketutil.FILE_TOTAL_TIMEOUT)
         local s = {}
         local c, h, st = socket.skip(1, transport.request({
             url      = url,

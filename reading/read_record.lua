@@ -8,12 +8,27 @@ function ReadRecord:new(settings)
     local obj = {
         settings = settings,
         records = {},
+        url_index = {},      -- bookUrl -> record 哈希索引，O(1) 查找
+        name_index = {},     -- bookName -> record 哈希索引，O(1) 查找
         save_path = H.join_path(H.get_data_dir(), "read_records.lua"),
     }
     setmetatable(obj, self)
     obj:load_records()
     Log.info("初始化阅读记录模块，已加载 " .. #obj.records .. " 条记录")
     return obj
+end
+
+function ReadRecord:rebuild_index()
+    self.url_index = {}
+    self.name_index = {}
+    for _, record in ipairs(self.records) do
+        if record.bookUrl and record.bookUrl ~= "" then
+            self.url_index[record.bookUrl] = record
+        end
+        if record.bookName and record.bookName ~= "" then
+            self.name_index[record.bookName] = record
+        end
+    end
 end
 
 function ReadRecord:load_records()
@@ -27,6 +42,7 @@ function ReadRecord:load_records()
             local ok, data = pcall(loadstring, content)
             if ok and type(data) == "table" then
                 self.records = data
+                self:rebuild_index()
                 Log.debug("从文件加载阅读记录: " .. #data .. " 条")
                 return
             end
@@ -38,6 +54,7 @@ function ReadRecord:load_records()
                 local ok2, data2 = pcall(json.decode, json_content)
                 if ok2 and type(data2) == "table" then
                     self.records = data2
+                    self:rebuild_index()
                     Log.info("从文件加载阅读记录(JSON fallback): " .. #data2 .. " 条")
                     return
                 end
@@ -46,11 +63,14 @@ function ReadRecord:load_records()
                 Log.warn("加载阅读记录失败: loadstring=" .. tostring(data) .. ", json模块不可用")
             end
             self.records = {}
+            self:rebuild_index()
         else
             self.records = {}
+            self:rebuild_index()
         end
     else
         self.records = {}
+        self:rebuild_index()
     end
 end
 
@@ -74,21 +94,13 @@ function ReadRecord:save_records()
 end
 
 function ReadRecord:get_record(book_url)
-    for _, record in ipairs(self.records) do
-        if record.bookUrl == book_url then
-            return record
-        end
-    end
-    return nil
+    if not book_url or book_url == "" then return nil end
+    return self.url_index[book_url]
 end
 
 function ReadRecord:get_record_by_name(book_name)
-    for _, record in ipairs(self.records) do
-        if record.bookName == book_name then
-            return record
-        end
-    end
-    return nil
+    if not book_name or book_name == "" then return nil end
+    return self.name_index[book_name]
 end
 
 function ReadRecord:update_record(book_url, book_name, read_time, last_read)
@@ -103,6 +115,8 @@ function ReadRecord:update_record(book_url, book_name, read_time, last_read)
             lastCheckTime = os.time(),
         }
         table.insert(self.records, record)
+        if book_url and book_url ~= "" then self.url_index[book_url] = record end
+        if book_name and book_name ~= "" then self.name_index[book_name] = record end
         Log.info("新增阅读记录: " .. book_url)
     else
         if read_time then
@@ -120,7 +134,10 @@ end
 function ReadRecord:delete_record(book_url)
     for i = #self.records, 1, -1 do
         if self.records[i].bookUrl == book_url then
+            local record = self.records[i]
             table.remove(self.records, i)
+            if book_url and book_url ~= "" then self.url_index[book_url] = nil end
+            if record.bookName and record.bookName ~= "" then self.name_index[record.bookName] = nil end
             self:save_records()
             Log.info("删除阅读记录: " .. book_url)
             return true
@@ -136,13 +153,17 @@ function ReadRecord:merge_from_sync(sync_records)
         local local_record = self:get_record_by_name(sync_record.bookName)
         
         if not local_record then
-            table.insert(self.records, {
+            local new_record = {
                 bookName = sync_record.bookName,
                 readTime = sync_record.readTime or 0,
                 lastRead = sync_record.lastRead or os.time() * 1000,
                 bookUrl = "",
                 lastCheckTime = os.time(),
-            })
+            }
+            table.insert(self.records, new_record)
+            if sync_record.bookName and sync_record.bookName ~= "" then
+                self.name_index[sync_record.bookName] = new_record
+            end
             updated_count = updated_count + 1
             Log.info("从同步新增记录: " .. sync_record.bookName)
         else

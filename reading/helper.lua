@@ -327,7 +327,7 @@ function H.unzip_file(zip_path, dest_dir)
         else
             local entry_path = H.join_path(dest_dir, raw_entry)
             -- 二次安全检查：确保解析后的路径仍在 dest_dir 内
-            if not entry_path:sub(1, #norm_dest) == norm_dest then
+            if entry_path:sub(1, #norm_dest) ~= norm_dest then
                 Log.warn("跳过逃逸目标目录的条目: " .. raw_entry)
             elseif entry.mode == "directory" then
                 H.make_dir(entry_path)
