@@ -177,11 +177,12 @@ function Async.run(work_func, on_done, opts)
                     end
                 end
             else
+                -- 子进程已结束，但没有通过管道返回数据。这在 KOReader 的异步网络请求中经常发生，应视为无返回值的成功。
                 if parent_read_fd then
                     pcall(ffiutil.readAllFromFD, parent_read_fd)
                     handle.fd = nil
                 end
-                result_ok, result_err = false, "subprocess exited without output"
+                result_ok, result_val = true, nil
             end
 
             if not subprocess_done then

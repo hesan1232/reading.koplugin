@@ -326,8 +326,12 @@ function WebDAV:_get_file_impl(path, progress_callback, total_size, file_handle)
         local STALL_TIMEOUT = 15
         local MIN_RATE = 1024 -- 1KB/s
 
-        local custom_sink = ltn12.sink.callback(function(chunk, err)
-            if err then return nil, err end
+        -- 使用闭包实现自定义 sink，KOReader 的 ltn12 可能不包含 sink.callback
+        local custom_sink = function(chunk, err)
+            if err then 
+                Log.error("下载出错或超时: " .. tostring(err))
+                return nil, err 
+            end
             if chunk then
                 bytes_downloaded = bytes_downloaded + #chunk
                 
@@ -336,7 +340,7 @@ function WebDAV:_get_file_impl(path, progress_callback, total_size, file_handle)
                 if current_time - last_check_time >= STALL_TIMEOUT then
                     local rate = (bytes_downloaded - last_check_bytes) / (current_time - last_check_time)
                     if rate < MIN_RATE then
-                        return nil, "download_stalled"
+                        return nil, "download stalled"
                     end
                     last_check_time = current_time
                     last_check_bytes = bytes_downloaded
@@ -352,8 +356,8 @@ function WebDAV:_get_file_impl(path, progress_callback, total_size, file_handle)
                     progress_callback(bytes_downloaded, total_size)
                 end
             end
-            return true
-        end)
+            return 1 -- 返回非 nil 值表示接收成功
+        end
 
         local c, h, st = socket.skip(1, transport.request({
             url      = url,
@@ -540,6 +544,25 @@ function WebDAV:_mkdir_impl(path)
         Log.error("WebDAV: cannot create folder:", status or code)
         return false, "创建失败: " .. tostring(status or code)
     end
+end
+
+function WebDAV:get_binary(url)
+    if not url or url == "" then return nil end
+    local transport = get_transport(url)
+    if not transport then return nil end
+
+    local resp = {}
+    local code, hdrs, status = transport.request({
+        url = url,
+        method = "GET",
+        sink = ltn12.sink.table(resp),
+        -- 封面图片不需要带 WebDAV 的认证信息
+    })
+
+    if type(code) == "number" and code >= 200 and code <= 299 then
+        return table.concat(resp)
+    end
+    return nil
 end
 
 function WebDAV:_parse_rfc1123_time(date_str)

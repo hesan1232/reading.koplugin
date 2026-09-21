@@ -164,6 +164,53 @@ function ReadingPlugin:onReaderReady()
     end
 end
 
+function ReadingPlugin:onDispatcherRegisterActions()
+    -- 将“开源阅读书架”注册到 KOReader 的手势/按键派发器中
+    Dispatcher:registerAction("reading_show_bookshelf", {
+        category = "none",
+        event = "ReadingShowBookshelf",
+        title = _("开源阅读：书架"),
+        general = true,
+    })
+    
+    -- 将“拉取进度”和“覆盖云端”注册到手势/按键派发器中
+    Dispatcher:registerAction("reading_pull_progress", {
+        category = "none",
+        event = "ReadingPullProgress",
+        title = _("开源阅读：拉取进度"),
+        general = true,
+    })
+    
+    Dispatcher:registerAction("reading_push_progress", {
+        category = "none",
+        event = "ReadingPushProgress",
+        title = _("开源阅读：覆盖云端"),
+        general = true,
+    })
+end
+
+function ReadingPlugin:onReadingShowBookshelf()
+    -- 延迟执行以确保从阅读界面或其他状态安全切换
+    UIManager:scheduleIn(0.1, function()
+        self:showBookshelf()
+    end)
+    return true
+end
+
+function ReadingPlugin:onReadingPullProgress()
+    UIManager:scheduleIn(0.1, function()
+        self:pull_cloud_progress()
+    end)
+    return true
+end
+
+function ReadingPlugin:onReadingPushProgress()
+    UIManager:scheduleIn(0.1, function()
+        self:push_cloud_progress()
+    end)
+    return true
+end
+
 function ReadingPlugin:init()
     self.settings = Settings:new()
     
@@ -183,6 +230,8 @@ function ReadingPlugin:init()
     if self.ui and self.ui.menu then
         self.ui.menu:registerToMainMenu(self)
     end
+    
+    self:onDispatcherRegisterActions()
     
     Log.info("开源阅读插件初始化完成")
 end
@@ -415,29 +464,26 @@ function ReadingPlugin:getWebDAVMenuItems()
 end
 
 function ReadingPlugin:getLogMenuItems()
-    local is_debug_on = Log.is_debug_enabled()
     return {
         {
             text = _("查看日志文件"),
-            keep_menu_open = true,
             callback = function()
                 self:view_log()
             end,
         },
         {
-            text = is_debug_on and _("关闭调试日志") or _("开启调试日志"),
-            keep_menu_open = true,
+            text = _("调试日志"),
             checked_func = function()
-                return is_debug_on
+                return Log.is_debug_enabled()
             end,
             callback = function()
-                Log.set_debug_enabled(not is_debug_on)
-                self:showInfo(is_debug_on and _("调试日志已关闭") or _("调试日志已开启"))
+                local new_state = not Log.is_debug_enabled()
+                Log.set_debug_enabled(new_state)
+                self:showInfo(new_state and _("调试日志已开启") or _("调试日志已关闭"))
             end,
         },
         {
             text = _("清除日志"),
-            keep_menu_open = true,
             callback = function()
                 Log.clear_log()
                 self:showInfo(_("日志已清除"))
@@ -560,7 +606,8 @@ function ReadingPlugin:sync_from_webdav_auto()
         function(ok, result, err)
             self_ref:closeBusy()
             if not ok or not result or not result.ok then
-                self_ref:showInfo(T(_("同步失败: %1"), err or (result and result.err)))
+                local err_msg = tostring(err or (result and result.err) or _("未知错误"))
+                self_ref:showInfo(_("同步失败: ") .. err_msg)
                 return
             end
             self_ref:_complete_sync(result.data)
@@ -586,7 +633,8 @@ function ReadingPlugin:show_webdav_file_list()
         function(ok, result, err)
             self_ref:closeBusy()
             if not ok or not result or not result.ok then
-                self_ref:showInfo(T(_("WebDAV 连接失败:\n%1"), err or (result and result.err)))
+                local err_msg = tostring(err or (result and result.err) or _("未知错误"))
+                self_ref:showInfo(_("WebDAV 连接失败:\n") .. err_msg)
                 return
             end
             ShelfView.show_webdav_file_list(sync_ref.webdav, function(filename, url)
@@ -641,7 +689,8 @@ function ReadingPlugin:perform_sync_from_file(filename, url)
         function(ok, result, err)
             self_ref:closeBusy()
             if not ok or not result or not result.ok then
-                self_ref:showInfo(T(_("同步失败:\n%1"), err or (result and result.err)))
+                local err_msg = tostring(err or (result and result.err) or _("未知错误"))
+                self_ref:showInfo(_("同步失败:\n") .. err_msg)
                 return
             end
             self_ref:_complete_sync(result.data)
@@ -683,16 +732,34 @@ function ReadingPlugin:show()
     -- 排序 self.bookshelf.books（必须在构建 valid_books 之前，否则 valid_books 不受排序影响）
     self.bookshelf:sort_books()
 
-    -- 从已排序的 books 构建 valid_books，保持排序顺序
+    -- 从已排序的 books 构建 valid_books，保持排序顺序，同时进行 去重
     local valid_books = {}
+    local seen_keys = {}
+    local show_downloaded_only = self.settings:get_show_downloaded_only()
+    
     for ___, book in ipairs(books) do
         local title = book.name or book.title or ""
-        if title ~= "" then
-            valid_books[#valid_books + 1] = book
+        local author = book.author or ""
+        local unique_key = title .. "|" .. author
+        local url = book.bookUrl or ""
+        
+        if title ~= "" and url ~= "" and not seen_keys[unique_key] then
+            local should_add = true
+            if show_downloaded_only then
+                local epub_path = self.bookshelf:get_epub_for_book(book)
+                if not epub_path then
+                    should_add = false
+                end
+            end
+            
+            if should_add then
+                seen_keys[unique_key] = true
+                valid_books[#valid_books + 1] = book
+            end
         end
     end
     books = valid_books
-    Log.info("show() valid_books 过滤后: " .. #books .. " 本，准备显示书架")
+    Log.info("show() valid_books 去重过滤后: " .. #books .. " 本，准备显示书架")
     
     UIHandles.set("menu", ShelfView.show{
         books = books,
@@ -707,6 +774,9 @@ function ReadingPlugin:show()
         on_sync_books = function()
             self:sync_epub_files()
         end,
+        on_left_button_tap = function(menu_instance)
+            self:show_sort_dialog(menu_instance)
+        end,
         on_settings = function()
             -- Settings are in main menu now
             if UIHandles.get("menu") then
@@ -718,6 +788,202 @@ function ReadingPlugin:show()
         end,
     })
     UIHandles.set("active_menu", UIHandles.get("menu"))
+end
+
+function ReadingPlugin:show_sort_dialog(menu_instance)
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local current_sort = self.settings:get_shelf_sort()
+    local show_downloaded_only = self.settings:get_show_downloaded_only()
+    
+    local function close_dlg()
+        if UIHandles.get("sort_dialog") then
+            UIManager:close(UIHandles.get("sort_dialog"))
+            UIHandles.clear("sort_dialog")
+        end
+    end
+    
+    local function do_sort(sort_key)
+        close_dlg()
+        self.settings:set_shelf_sort(sort_key)
+        self.bookshelf:sort_books(true)
+        -- 重新渲染书架
+        if menu_instance and not menu_instance._reading_closed then
+            -- 这里直接更新传入的菜单实例并重建列表
+            UIManager:close(menu_instance)
+            self:show()
+        end
+    end
+
+    local function toggle_downloaded_only()
+        close_dlg()
+        self.settings:set_show_downloaded_only(not show_downloaded_only)
+        if menu_instance and not menu_instance._reading_closed then
+            UIManager:close(menu_instance)
+            self:show()
+        end
+    end
+
+    local function show_cloud_library()
+        close_dlg()
+        self:show_cloud_library(menu_instance)
+    end
+
+    local btns = {}
+    table.insert(btns, {
+        {
+            text = _("云端书库"),
+            callback = show_cloud_library,
+        }
+    })
+    table.insert(btns, {
+        {
+            text = _("仅显示已下载") .. (show_downloaded_only and "  ✓" or ""),
+            callback = toggle_downloaded_only,
+        }
+    })
+    table.insert(btns, {
+        {
+            text = _("按最后阅读") .. (current_sort == "last_read" and "  ✓" or ""),
+            callback = function() do_sort("last_read") end,
+        }
+    })
+    table.insert(btns, {
+        {
+            text = _("按更新时间") .. (current_sort == "latest_update" and "  ✓" or ""),
+            callback = function() do_sort("latest_update") end,
+        }
+    })
+    table.insert(btns, {
+        {
+            text = _("按书名") .. ((current_sort == "book_name" or current_sort == "title") and "  ✓" or ""),
+            callback = function() do_sort("book_name") end,
+        }
+    })
+    table.insert(btns, { { text = _("取消"), callback = close_dlg } })
+
+    local dlg = ButtonDialog:new{
+        title = _("菜单"),
+        title_align = "center",
+        align = "center",
+        buttons = btns,
+    }
+    
+    UIHandles.set("sort_dialog", dlg)
+    UIManager:show(dlg)
+end
+
+function ReadingPlugin:show_cloud_library(menu_instance)
+    self:showBusy(_("正在获取云端书库..."))
+    
+    local sync_ref = self.sync
+    local self_ref = self
+    self:_async_run(
+        function()
+            local ok, epub_files, err = sync_ref:list_books_directory()
+            if not ok then
+                return { ok = false, err = err }
+            end
+            return { ok = true, files = epub_files }
+        end,
+        function(ok, result, err)
+            self_ref:closeBusy()
+            if not ok or not result or not result.ok then
+                local err_msg = tostring(err or (result and result.err) or _("未知错误"))
+                self_ref:showInfo(_("获取云端书库失败:\n") .. err_msg)
+                return
+            end
+            ShelfView.show_cloud_library_list(result.files, function(file)
+                self_ref:download_cloud_book(file, menu_instance)
+            end)
+        end,
+        { timeout = 30 }
+    )
+end
+
+function ReadingPlugin:download_cloud_book(file, menu_instance)
+    local DownloadProgress = require("reading.download_progress")
+    
+    local progress = DownloadProgress:new{
+        title = _("下载书籍"),
+        on_cancel = function()
+            self._download_cancelled = true
+        end,
+    }
+    progress:show()
+    
+    UIManager:scheduleIn(0.1, self:_guard(_("下载书籍"), function()
+        if progress:isCanceled() then
+            progress:close()
+            return
+        end
+
+        progress:setState{ 
+            stage = "content", 
+            file = file.name,
+            current = 1,
+            total = 1,
+            percent = 0,
+            message = _("正在下载...") 
+        }
+
+        local books_dir = H.get_books_dir()
+        H.make_dir(books_dir)
+        local save_path = H.join_path(books_dir, file.name)
+
+        if H.file_exists(save_path) then
+            local local_size = H.get_file_size(save_path)
+            if local_size and file.size and local_size == file.size then
+                progress:setState{ stage = "done", message = _("文件已存在") }
+                UIManager:scheduleIn(1, function() 
+                    progress:close() 
+                    self:_ensure_book_in_shelf(file.name)
+                    if menu_instance and not menu_instance._reading_closed then
+                        UIManager:close(menu_instance)
+                        self:show()
+                    end
+                end)
+                return
+            end
+        end
+
+        local ok, __, err = self.sync:download_epub(file.path, save_path)
+        if ok then
+            progress:setState{ stage = "done", message = _("下载成功") }
+        else
+            progress:setState{ stage = "error", message = tostring(err) }
+        end
+
+        UIManager:scheduleIn(1.5, function() 
+            progress:close() 
+            if ok then
+                self:_ensure_book_in_shelf(file.name)
+                if menu_instance and not menu_instance._reading_closed then
+                    UIManager:close(menu_instance)
+                    self:show()
+                end
+            end
+        end)
+    end))
+end
+
+function ReadingPlugin:_ensure_book_in_shelf(filename)
+    local book_name = filename:gsub("%.epub$", ""):gsub("%.txt$", "")
+    
+    local existing = self.bookshelf:get_book_by_name(book_name)
+    if existing then return end
+    
+    local new_book = {
+        name = book_name,
+        author = "",
+        bookUrl = "local://" .. H.url_encode(book_name),
+        lastCheckTime = os.time() * 1000,
+        is_local_only = true
+    }
+    
+    table.insert(self.bookshelf.books, new_book)
+    self.bookshelf:rebuild_index()
+    self.bookshelf:save_bookshelf_cache()
+    Log.info("手动添加云端书籍到书架: " .. book_name)
 end
 
 function ReadingPlugin:perform_sync(url)
@@ -735,7 +1001,8 @@ function ReadingPlugin:perform_sync(url)
         function(ok, result, err)
             self_ref:closeBusy()
             if not ok or not result or not result.ok then
-                self_ref:showInfo(T(_("同步失败: %1"), err or (result and result.err)))
+                local err_msg = tostring(err or (result and result.err) or _("未知错误"))
+                self_ref:showInfo(_("同步失败: ") .. err_msg)
                 return
             end
             self_ref:_complete_sync(result.data)
@@ -824,6 +1091,16 @@ function ReadingPlugin:show_book_detail(book)
                         UIManager:close(UIHandles.get("detail_dialog"))
                         UIHandles.clear("detail_dialog")
                         self_ref:push_cloud_progress()
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("删除书籍"),
+                    callback = function()
+                        UIManager:close(UIHandles.get("detail_dialog"))
+                        UIHandles.clear("detail_dialog")
+                        self_ref:delete_book(book)
                     end,
                 },
             },
@@ -954,6 +1231,43 @@ function ReadingPlugin:show_book_intro(book)
             timeout = 2,
         })
     end
+end
+
+function ReadingPlugin:delete_book(book)
+    local ConfirmBox = require("ui/widget/confirmbox")
+    local title = book.name or book.title or _("未命名")
+    
+    UIManager:show(ConfirmBox:new{
+        text = T(_("确定要删除《%1》的本地文件和缓存吗？\n\n这只会删除已下载的文件，书籍仍会保留在书架中。"), title),
+        ok_text = _("删除"),
+        ok_callback = function()
+            -- 1. 删除本地文件
+            local epub_path = self.bookshelf:get_epub_for_book(book)
+            if epub_path and H.file_exists(epub_path) then
+                os.remove(epub_path)
+                Log.info("已删除本地书籍文件: " .. epub_path)
+            end
+            
+            -- 2. 清理章节缓存（不再调用不存在的 remove_record）
+            local url = book.bookUrl or ""
+            if url ~= "" then
+                self.bookshelf:clear_book_cache(url)
+            end
+            
+            -- 3. 不从书架列表中移除书籍，这样非"仅显示已下载"视图中还能看到它
+            
+            self:showInfo(T(_("已删除《%1》的本地文件"), title))
+            
+            -- 4. 刷新书架视图 (使用 scheduleIn 避免在 Dialog callback 中直接操作 UI 导致闪退)
+            UIManager:scheduleIn(0.1, function()
+                local menu_instance = UIHandles.get("active_menu")
+                if menu_instance and not menu_instance._reading_closed then
+                    UIManager:close(menu_instance)
+                    self:show()
+                end
+            end)
+        end,
+    })
 end
 
 function ReadingPlugin:start_reading(book)
@@ -2003,7 +2317,7 @@ function ReadingPlugin:_find_chapter_by_title(chapters, title)
     end
 
     -- 2. 去空格匹配（标题可能因 EPUB/Legado 解析差异导致空格不同）
-    local norm_title = title:gsub("%s+", "")
+    local norm_title = type(title) == "string" and title:gsub("%s+", "") or ""
     if norm_title ~= "" then
         for i, ch in ipairs(chapters) do
             -- 如果有预处理好的 norm_name，直接使用，否则实时计算并缓存

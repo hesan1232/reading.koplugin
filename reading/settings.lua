@@ -29,6 +29,7 @@ local defaults = {
     },
     shelf = {
         sort_order = "last_read",
+        show_downloaded_only = false,
     },
     advanced = {
         developer_logs = false,
@@ -324,6 +325,33 @@ function Settings:set_webdav_remote_path(path)
     local webdav = self:get("webdav") or {}
     webdav.remote_path = path
     self:set("webdav", webdav)
+    self:flush()
+end
+
+function Settings:get_shelf_sort()
+    local shelf = self:get("shelf")
+    return shelf and shelf.sort_order or "last_read"
+end
+
+function Settings:set_shelf_sort(sort_key)
+    local shelf = self:get("shelf") or {}
+    shelf.sort_order = sort_key
+    self:set("shelf", shelf)
+    self:flush()
+end
+
+function Settings:get_show_downloaded_only()
+    local shelf = self:get("shelf")
+    if shelf and shelf.show_downloaded_only ~= nil then
+        return shelf.show_downloaded_only
+    end
+    return false
+end
+
+function Settings:set_show_downloaded_only(show_only)
+    local shelf = self:get("shelf") or {}
+    shelf.show_downloaded_only = show_only
+    self:set("shelf", shelf)
     self:flush()
 end
 

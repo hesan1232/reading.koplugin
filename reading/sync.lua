@@ -112,8 +112,12 @@ function Sync:load_from_extracted_dir(extract_dir)
     
     local lfs = require("libs/libkoreader-lfs")
     
+    local target_files = {
+        ["bookshelf.json"] = true,
+    }
+
     for entry in lfs.dir(extract_dir) do
-        if entry ~= "." and entry ~= ".." then
+        if target_files[entry] then
             local full_path = H.join_path(extract_dir, entry)
             local mode = lfs.attributes(full_path, "mode")
             if mode == "file" then
@@ -124,7 +128,18 @@ function Sync:load_from_extracted_dir(extract_dir)
                     local content = file:read("*all")
                     file:close()
                     
-                    local data = H.json_decode(content)
+                    local data = nil
+                    local is_json = entry:match("%.json$")
+                    
+                    if is_json then
+                        local ok, decoded = pcall(H.json_decode, content)
+                        if ok and decoded then
+                            data = decoded
+                        else
+                            Log.warn("JSON解码失败: " .. entry)
+                        end
+                    end
+                    
                     if data and type(data) == "table" then
                         if entry == "bookshelf.json" then
                             for _, book in ipairs(data) do
@@ -156,6 +171,10 @@ function Sync:load_from_extracted_dir(extract_dir)
                     Log.warn("无法打开文件: " .. entry)
                 end
             end
+        else
+            if entry ~= "." and entry ~= ".." then
+                Log.debug("跳过无关文件: " .. entry)
+            end
         end
     end
     
@@ -171,44 +190,16 @@ function Sync:load_from_files(files)
     self.read_records = {}
     
     if files["bookshelf.json"] then
-        local data = H.json_decode(files["bookshelf.json"])
+        local data = files["bookshelf.json"]
+        if type(data) == "string" then
+            local ok, decoded = pcall(H.json_decode, data)
+            data = ok and decoded or nil
+        end
         if data and type(data) == "table" then
             for _, book in ipairs(data) do
                 table.insert(self.bookshelf, book)
             end
             Log.info("加载书架: " .. #self.bookshelf .. " 本书")
-        end
-    end
-    
-    if files["bookSource.json"] then
-        local data = H.json_decode(files["bookSource.json"])
-        if data and type(data) == "table" then
-            for _, source in ipairs(data) do
-                table.insert(self.book_sources, source)
-            end
-            Log.info("加载书源: " .. #self.book_sources .. " 个")
-        end
-    end
-    
-    if files["replaceRule.json"] then
-        local data = H.json_decode(files["replaceRule.json"])
-        if data and type(data) == "table" then
-            for _, rule in ipairs(data) do
-                if rule.isEnabled ~= false then
-                    table.insert(self.replace_rules, rule)
-                end
-            end
-            Log.info("加载替换规则: " .. #self.replace_rules .. " 条")
-        end
-    end
-
-    if files["readRecord.json"] then
-        local data = H.json_decode(files["readRecord.json"])
-        if data and type(data) == "table" then
-            for _, record in ipairs(data) do
-                table.insert(self.read_records, record)
-            end
-            Log.info("加载阅读记录: " .. #self.read_records .. " 条")
         end
     end
     
@@ -252,12 +243,12 @@ function Sync:list_books_directory()
     
     local epub_files = {}
     for _, item in ipairs(items) do
-        if item.name and item.name:match("%.epub$") then
+        if item.name and (item.name:match("%.epub$") or item.name:match("%.txt$")) then
             table.insert(epub_files, {
                 name = item.name,
                 path = "books/" .. item.name,
                 size = item.size,
-                modified = item.modified,
+                modified = item.mtime or item.modified,
             })
         end
     end

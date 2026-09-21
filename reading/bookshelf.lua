@@ -27,17 +27,87 @@ function Bookshelf:load_sync_data(sync)
 end
 
 --- 从同步数据应用到本地书架（替代原 load_sync_data，解耦 Bookshelf 对 Sync 的直接依赖）
+-- 策略：以云端数据（Legado）为基准，如果本地存在该书的阅读进度等数据，则合并到云端记录中
 -- @param data table  { books, book_sources, replace_rules, read_records }
 function Bookshelf:apply_sync_data(data)
     if not data then return end
 
-    self.books = data.books or {}
+    local remote_books = data.books or {}
+    
+    -- 构建本地现有书架索引（按 bookUrl）
+    local local_index = {}
+    for _, book in ipairs(self.books) do
+        if book.bookUrl and book.bookUrl ~= "" then
+            local_index[book.bookUrl] = book
+        end
+    end
+
+    local merged_bookshelf = {}
+    local seen_keys = {}
+    
+    for _, remote_book in ipairs(remote_books) do
+        -- Legado 书架去重逻辑：主要以 bookUrl 为主，但有时云端脏数据会出现 URL 一样但名字不同的残影。
+        -- 采用 (name + author) 组合去重更严谨，避免同名书籍因书源不同产生多条。
+        local name = remote_book.name or remote_book.title or ""
+        local author = remote_book.author or ""
+        
+        -- 跳过无用的空书籍（可能是 Legado 生成的脏数据或解析错误）
+        if name ~= "" and name ~= "未命名" then
+            local unique_key = name .. "|" .. author
+            local url = remote_book.bookUrl or ""
+            
+            if not seen_keys[unique_key] then
+                seen_keys[unique_key] = true
+                
+                -- 尝试在本地书架查找此书
+                local local_book = local_index[url]
+                if local_book then
+                    -- 保留本地特有字段
+                    remote_book.toc_offset = local_book.toc_offset or remote_book.toc_offset
+                    
+                    -- 比较阅读时间，若本地更新则采用本地进度
+                    local remote_time = remote_book.durChapterTime or remote_book.lastCheckTime or 0
+                    local local_time = local_book.durChapterTime or local_book.lastCheckTime or 0
+                    
+                    if local_time > remote_time then
+                        Log.debug("apply_sync_data: 使用本地进度覆盖云端: " .. (remote_book.name or ""))
+                        remote_book.durChapterIndex = local_book.durChapterIndex
+                        remote_book.durChapterPos = local_book.durChapterPos
+                        remote_book.durChapterTitle = local_book.durChapterTitle
+                        remote_book.durChapterTime = local_book.durChapterTime
+                        remote_book.lastCheckTime = local_book.lastCheckTime
+                    end
+                end
+                table.insert(merged_bookshelf, remote_book)
+            end
+        end
+    end
+
+    -- 补充逻辑：保留已被云端删除，但本地已下载（存在EPUB或缓存）的书籍
+    for _, local_book in ipairs(self.books) do
+        local name = local_book.name or local_book.title or ""
+        local author = local_book.author or ""
+        if name ~= "" and name ~= "未命名" then
+            local unique_key = name .. "|" .. author
+            if not seen_keys[unique_key] then
+                -- 这本书在云端已被删除，检查本地是否有下载
+                if self:is_epub_available(local_book) then
+                    Log.debug("apply_sync_data: 保留云端已删但本地已下载的书籍: " .. name)
+                    seen_keys[unique_key] = true
+                    table.insert(merged_bookshelf, local_book)
+                end
+            end
+        end
+    end
+
+    self.books = merged_bookshelf
     self.sources = data.book_sources or {}
     self.replace_rules = data.replace_rules or {}
     self.sorted = false
     self:rebuild_index()
+    self:invalidate_epub_cache()
 
-    Log.info("加载完成: " .. #self.books .. " 本书")
+    Log.info("加载并合并完成，现存: " .. #self.books .. " 本书")
 end
 
 --- 重建书名和URL索引，用于 O(1) 查找
@@ -61,10 +131,10 @@ function Bookshelf:get_book_by_name(name)
     return self.name_index[name:lower()]
 end
 
-function Bookshelf:sort_books()
-    if self.sorted then return end
+function Bookshelf:sort_books(force_resort)
+    if self.sorted and not force_resort then return end
 
-    local sort_order = self.settings:get_shelf_sort_order()
+    local sort_order = self.settings:get_shelf_sort()
     
     Log.debug("排序方式: " .. sort_order)
     
@@ -73,26 +143,33 @@ function Bookshelf:sort_books()
         sort_func = function(a, b)
             local time_a = a.durChapterTime or a.lastCheckTime or 0
             local time_b = b.durChapterTime or b.lastCheckTime or 0
-            return time_a > time_b
+            if time_a ~= time_b then
+                return time_a > time_b
+            end
+            return (a.name or a.title or "") < (b.name or b.title or "")
         end
-    elseif sort_order == "progress" then
+    elseif sort_order == "latest_update" then
         sort_func = function(a, b)
-            local progress_a = (a.durChapterIndex or 0) / (a.totalChapterNum or 1)
-            local progress_b = (b.durChapterIndex or 0) / (b.totalChapterNum or 1)
-            return progress_a < progress_b
+            local time_a = a.latestChapterTime or 0
+            local time_b = b.latestChapterTime or 0
+            if time_a ~= time_b then
+                return time_a > time_b
+            end
+            return (a.name or a.title or "") < (b.name or b.title or "")
         end
-    elseif sort_order == "title" then
+    elseif sort_order == "title" or sort_order == "book_name" then
         sort_func = function(a, b)
             return (a.name or a.title or "") < (b.name or b.title or "")
         end
-    elseif sort_order == "added" then
-        sort_func = function(a, b)
-            local time_a = a.lastCheckTime or a.durChapterTime or 0
-            local time_b = b.lastCheckTime or b.durChapterTime or 0
-            return time_a > time_b
-        end
     else
-        sort_func = function(a, b) return true end
+        sort_func = function(a, b)
+            local time_a = a.durChapterTime or a.lastCheckTime or 0
+            local time_b = b.durChapterTime or b.lastCheckTime or 0
+            if time_a ~= time_b then
+                return time_a > time_b
+            end
+            return (a.name or a.title or "") < (b.name or b.title or "")
+        end
     end
     
     table.sort(self.books, sort_func)

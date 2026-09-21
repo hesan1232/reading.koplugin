@@ -51,7 +51,9 @@ function ShelfItem:init()
 
     local h = self.dimen.h
     local side = math.max(Size.padding.small, Screen:scaleBySize(4))
+    
     local text_w = math.max(Screen:scaleBySize(120), self.dimen.w - side * 2)
+    
     local title = TextBoxWidget:new{
         text = tostring(self.entry.title or _("未命名")),
         face = Font:getFace("cfont", math.min(22, Screen:scaleBySize(18))),
@@ -83,6 +85,7 @@ function ShelfItem:init()
         VerticalSpan:new{height = math.max(1, Screen:scaleBySize(2))},
         info,
     }
+    
     local row = HorizontalGroup:new{
         align = "center",
         HorizontalSpan:new{width = side},
@@ -132,9 +135,16 @@ end
 local ShelfMenu = Menu:extend{
     on_page_changed = nil,
     on_close_callback = nil,
+    on_left_button_tap = nil,
     _reading_closed = false,
     _suppress_page_callback = false,
 }
+
+function ShelfMenu:onLeftButtonTap()
+    if self.on_left_button_tap then
+        self.on_left_button_tap(self)
+    end
+end
 
 function ShelfMenu:onMenuSelect(entry, pos)
     return Menu.onMenuSelect(self, entry)
@@ -233,37 +243,16 @@ function ShelfView.show(opts)
         end
     end
     
-    table.insert(items, {
-        text = "--",
-        separator = true,
-    })
-    
-    table.insert(items, {
-        text = "同步数据",
-        callback = function()
-            if opts.on_sync then
-                opts.on_sync()
-            end
-        end,
-    })
-    
-    table.insert(items, {
-        text = "同步书籍",
-        callback = function()
-            if opts.on_sync_books then
-                opts.on_sync_books()
-            end
-        end,
-    })
-    
     local menu = ShelfMenu:new{
         title = opts.title or _("书架"),
+        title_bar_left_icon = "appbar.menu",
         item_table = items,
         items_per_page = 7,
         is_borderless = true,
         title_bar_fm_style = true,
         on_close_callback = opts.on_close,
         on_page_changed = page_callback,
+        on_left_button_tap = opts.on_left_button_tap,
     }
     
     UIManager:show(menu)
@@ -371,6 +360,82 @@ function ShelfView.show_webdav_file_list(webdav, on_select)
     -- 保存对话框引用到全局 UIHandles，确保能可靠关闭
     if ok_U then
         UIHandles.set("webdav_file_list", menu)
+    end
+
+    UIManager:show(menu)
+end
+
+function ShelfView.show_cloud_library_list(files, on_select)
+    local ok_gettext, gettext = pcall(require, "gettext")
+    local _ = ok_gettext and gettext or function(text) return text end
+    local ok_UIManager, UIManager = pcall(require, "ui/uimanager")
+    local ok_Menu, Menu = pcall(require, "ui/widget/menu")
+    local ok_InfoMessage, InfoMessage = pcall(require, "ui/widget/infomessage")
+    local ok_U, UIHandles = pcall(require, "reading/ui_handles")
+
+    if not files or type(files) ~= "table" or #files == 0 then
+        if ok_InfoMessage then
+            UIManager:show(InfoMessage:new{
+                text = _("云端未找到书籍文件"),
+                timeout = 3,
+            })
+        end
+        return
+    end
+
+    local item_table = {}
+    for _, file in ipairs(files) do
+        local size_str = file.size or 0
+        if size_str > 1024 * 1024 then
+            size_str = string.format("%.2f MB", size_str / (1024 * 1024))
+        elseif size_str > 1024 then
+            size_str = string.format("%.2f KB", size_str / 1024)
+        else
+            size_str = size_str .. " B"
+        end
+
+        local time_str = ""
+        if file.modified then
+            local ts = tonumber(file.modified)
+            if ts then
+                time_str = os.date("%Y-%m-%d %H:%M", ts)
+            end
+        end
+
+        table.insert(item_table, {
+            text = file.name,
+            sub_item = size_str .. (time_str ~= "" and (" | " .. time_str) or ""),
+            modified = file.modified,
+            callback = function()
+                if ok_U and UIHandles.get("cloud_library_list") then
+                    UIManager:close(UIHandles.get("cloud_library_list"))
+                    UIHandles.clear("cloud_library_list")
+                end
+                if on_select then
+                    on_select(file)
+                end
+            end,
+        })
+    end
+
+    table.sort(item_table, function(a, b)
+        local mtime_a = tonumber(a.modified) or 0
+        local mtime_b = tonumber(b.modified) or 0
+        if mtime_a ~= mtime_b then
+            return mtime_a > mtime_b
+        end
+        return (a.text or "") > (b.text or "")
+    end)
+
+    local menu = Menu:new{
+        title = _("云端书库"),
+        item_table = item_table,
+        is_borderless = true,
+        title_bar_fm_style = true,
+    }
+
+    if ok_U then
+        UIHandles.set("cloud_library_list", menu)
     end
 
     UIManager:show(menu)
