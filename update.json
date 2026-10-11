@@ -1,16 +1,16 @@
 {
-  "version": "0.3.0",
-  "name": "开源阅读 0.3.0",
+  "version": "0.3.1",
+  "name": "开源阅读 0.3.1",
   "channel": "stable",
   "package_type": "full",
-  "package_url": "https://github.com/hesan1232/reading.koplugin/releases/download/v0.3.0/reading.koplugin.zip",
+  "package_url": "https://github.com/hesan1232/reading.koplugin/releases/download/v0.3.1/reading.koplugin.zip",
   "package_urls": [
-    "https://github.com/hesan1232/reading.koplugin/releases/download/v0.3.0/reading.koplugin.zip",
-    "https://ghfast.top/https://github.com/hesan1232/reading.koplugin/releases/download/v0.3.0/reading.koplugin.zip",
-    "https://gh-proxy.com/https://github.com/hesan1232/reading.koplugin/releases/download/v0.3.0/reading.koplugin.zip",
-    "https://ghproxy.net/https://github.com/hesan1232/reading.koplugin/releases/download/v0.3.0/reading.koplugin.zip"
+    "https://github.com/hesan1232/reading.koplugin/releases/download/v0.3.1/reading.koplugin.zip",
+    "https://ghfast.top/https://github.com/hesan1232/reading.koplugin/releases/download/v0.3.1/reading.koplugin.zip",
+    "https://gh-proxy.com/https://github.com/hesan1232/reading.koplugin/releases/download/v0.3.1/reading.koplugin.zip",
+    "https://ghproxy.net/https://github.com/hesan1232/reading.koplugin/releases/download/v0.3.1/reading.koplugin.zip"
   ],
-  "size": 185566,
-  "sha256": "71684180d3a9b949dfae70928e442d1e4cef894b7a3ce9a0fa29edbc5b7acd15",
-  "notes": "**新增：插件内「检查更新」与一键升级**（设计参考觅阅 miuread）\n\n- **检查更新**：菜单「开源阅读 → 检查更新 → 立即检查更新」。从 GitHub Release 的\n  `update.json` 读最新版本号做语义化比对。清单里同时带 4 个下载地址（GitHub 原址 + 3 个国内\n  镜像），直连不通时自动换下一个。\n- **自动检查**：启动 5 秒后静默检查一次，默认 24 小时最多一次（可关、可改频率），同一个新版本\n  只提醒一次。**只在已联网时检查**，绝不主动开 WiFi。\n- **下载与安装**：下载后强制校验 SHA-256 → 解压到暂存目录并校验包结构与包内版本号 →\n  备份当前插件 → 替换 → 恢复用户配置。任何一步失败都自动回滚到旧版本。\n- **安装后重启**：可选「询问（默认）/ 自动重启 / 稍后手动」。重启后插件启动时比对\n  「期望版本 vs 实际运行版本」，一致才算更新成功并清掉回滚点；不一致则保留备份并给出回滚入口。\n- **保留用户配置**：`config.lua`（含 WebDAV 地址与口令）在升级时被完整保留。更新包本身也"
+  "size": 189159,
+  "sha256": "64219311c6aca777e6a2ea6dda7e1c52e5b696e8b6435befec3fd93c66e4bac1",
+  "notes": "**修复在线更新 403 误报 + 下载镜像可手选**（设计参考 appstore.koplugin）\n\n- **检查更新失败不再只报最后一个错误**：所有清单地址（直连 + 镜像）逐个尝试，失败时\n  按**主机名**聚合报出 —— 直连被墙（连接重置）与镜像限流（HTTP 403）从此一眼可分。\n- **新增「下载镜像」菜单**：自动（默认）/ 仅直连 GitHub / 四个预设镜像 / 自定义前缀。\n  镜像站按 IP 限流，哪个能用完全取决于当时网络 —— 换一个常能解决「检查更新失败」。\n- **镜像偏好同时作用于清单检查与安装包下载**，下载内容仍强制校验 SHA-256，安装内容不受影响。\n- **修复：SHA-256 校验永远不通过的隐藏 bug** —— Lua 模式不支持 `{64}` 量词，\n  `^%x{64}$` 会把合法哈希全部拒掉（此前一直被网络层错误掩盖）；现改为长度 + `^%x+$` 校验。"
 }
