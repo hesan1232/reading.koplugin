@@ -17,58 +17,137 @@ end
 local WidgetContainer, ok = safe_require("ui/widget/container/widgetcontainer", true)
 if not ok then return end
 
-local lfs = safe_require("libs/libkoreader-lfs")
-
 local UIManager = safe_require("ui/uimanager")
-
-local InfoMessage = safe_require("ui/widget/infomessage")
-
-local ConfirmBox = safe_require("ui/widget/confirmbox")
-
-local InputDialog = safe_require("ui/widget/inputdialog")
-
-local Menu = safe_require("ui/widget/menu")
 
 local H = require("reading.helper")
 
-local Event = safe_require("ui/event")
-
-local logger = safe_require("logger")
-
 local ok_gettext, gettext = pcall(require, "gettext")
 local _ = ok_gettext and gettext or function(text) return text end
+-- ⚠️ template 必须从 "ffi/util" 取：frontend/util.lua 的 util.template 是 nil
+-- （它只在模块内部 local T = ffiUtil.template，没有导出）——曾因此掉进
+-- fallback「原样返回」分支，提示里打出未替换的 %1（menus.lua 的写法是对的）。
+local ok_ffiutil, ffiutil = pcall(require, "ffi/util")
+local T = ok_ffiutil and ffiutil.template or function(t, ...) return t end
 
-local T_util = safe_require("ffi/util")
-local T = T_util and T_util.template or function(str, ...) return str end
-
-local util = safe_require("util")
-
-local Device = safe_require("device")
-local Screen = Device and Device.screen
+local Dispatcher = safe_require("dispatcher")
 
 -- Local libs
-local Settings = safe_require("reading.settings")
-local Sync = safe_require("reading.sync")
-local Bookshelf = safe_require("reading.bookshelf")
-local ReadRecord = safe_require("reading.read_record")
 local ShelfView = safe_require("reading.shelf_view")
 local Log = safe_require("reading.log")
-local Result = safe_require("reading.result")
-local Async = safe_require("reading.async")
-
-local unpack_args = unpack or table.unpack
+local Store = safe_require("reading.store")
+-- 说明：Settings / Sync / Bookshelf / ReadRecord 只在 reading/store.lua 里构造，
+-- 本文件改为从 Store.get() 取单例，因此不再直接 require（P0-4）。
 
 -- 阅读上下文状态（替代原 _state 中的阅读会话字段，含 generation 令牌防竞态）
 local Context = require("reading.reading_context")
 -- UI 句柄管理（替代原 _state 中的 UI 字段，修复 chapter_list_menu 泄漏）
 local UIHandles = require("reading.ui_handles")
 
+-- 自更新：updater_ui 负责菜单与流程编排，updater / digests / updater_http 由它按需 require。
+-- 刻意**不**放进下面那份 mixin 合并列表 —— 那些函数的签名是 UI.xxx(plugin, ...)，
+-- 不是插件方法，合并进去只会把 startup / check_update 之类的名字污染到 ReadingPlugin 上。
+local ok_updater_ui, UpdaterUI = pcall(require, "reading.updater_ui")
+if not ok_updater_ui then UpdaterUI = nil end
+
 local ReadingPlugin = WidgetContainer:extend{
+    -- fullname / description / version 不在此重复定义：KOReader 的 PluginLoader 会
+    -- 把 _meta.lua 的全部键（name 除外）覆盖到插件实例上
+    -- （见 koreader frontend/pluginloader.lua:253-262），写在这里的值永远不会生效。
+    -- 因此 _meta.lua 是这些字段的单一来源，改版本号请只改 _meta.lua。
     name = "reading",
     is_doc_only = false,
-    fullname = "开源阅读",
-    version = "0.1.0",
 }
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- 「首页被别的控件遮住时，依然能收到 Dispatcher 派发的动作事件」
+-- ════════════════════════════════════════════════════════════════════════════
+--
+-- 【问题】UIManager:sendEvent（frontend/ui/uimanager.lua:884）先把事件送给窗口栈最上面
+-- 那个非 toast 控件；它不消费时，才继续送给「该控件的 active_widgets」以及
+-- 「is_always_active 的控件」。而 FileManager / ReaderUI 自身都不是 is_always_active
+-- （全仓库只有前光 / 自然光 / 输入框 / 键盘等 6 处是），所以：
+--
+--   **只要有控件盖在首页之上**（例如第三方桌面类插件），Dispatcher 派发到本插件的
+--   动作就永远送不到它。
+--
+-- 现象恰好是「菜单能打开书架、手势点了没反应」—— 菜单项是回调直接调方法，不走事件派发；
+-- 手势要走 Dispatcher:execute → UIManager:sendEvent。（2026-10-11 在设备上实测确认：
+-- 把覆盖首页的那个插件关掉，手势立刻恢复。）
+--
+-- 【上游留的口子】FileManager/ReaderUI:registerModule(name, module, always_active)
+-- 第三个参数为 true 时会把 module 插进 self.active_widgets，注释写着
+-- "to get events even when hidden"。但插件实例是由 PluginLoader 创建后交给
+-- registerModule 的，第三个参数没传（= false）→ 插件默认收不到被遮挡时的事件。
+-- 这里把自己补进去。（不能反过来去调 registerModule：它内部还会
+-- table.insert(self, module)，会让插件在 FileManager 的数组部分出现两次，
+-- propagateEvent 就会把它调两遍。）
+--
+-- 【为什么用一个「只放行自有事件」的桥，而不是把插件本身插进去】
+--   ① 插件已经在 FileManager/ReaderUI 的**数组部分**（registerModule 里的
+--      table.insert(self, ui_module)）。sendEvent 在「top_widget 自己」这条路径上
+--      会经 WidgetContainer:propagateEvent 把事件送到插件一次；若插件同时也在
+--      active_widgets 里，同一次 sendEvent 会在「top_widget 没消费」之后**再送一次**
+--      （uimanager.lua:906-918）。桥只放行下面这几个自有事件，而这些事件的处理函数
+--      都返回 true（= 已消费）→ 第一条路径就截断了，第二条根本轮不到桥，不会重复触发。
+--   ② 桥把「因被遮挡而新增的接收面」严格限制在自有事件上 —— 插件永远不会因为被遮挡
+--      而多收到 Touch / Gesture / KeyPress 等输入事件，行为零回归。
+--
+-- 幂等；ui 结构不符合预期时安全退出（退化为原有行为）。
+--
+-- 放行表用 Event.handler 名（frontend/ui/event.lua:31 是 `handler = "on"..name`）。
+local DISPATCH_HANDLERS = {
+    onReadingShowBookshelf = true,
+    onReadingPullProgress  = true,
+    onReadingPushProgress  = true,
+}
+
+local function ensure_dispatch_reachable(plugin)
+    local ui = plugin and plugin.ui
+    if not ui or type(ui.active_widgets) ~= "table" then
+        return false
+    end
+    local bridge = plugin._dispatch_bridge
+    if not bridge then
+        -- 桥只认「我们自己的事件」，其余一律返回 nil（不消费、不干扰上游传播）。
+        bridge = {
+            handleEvent = function(_, event)
+                local handler = event and event.handler
+                if not handler or not DISPATCH_HANDLERS[handler] then
+                    return nil
+                end
+                return plugin:handleEvent(event)
+            end,
+        }
+        plugin._dispatch_bridge = bridge
+    end
+    for _, w in ipairs(ui.active_widgets) do
+        if w == bridge then return true end
+    end
+    table.insert(ui.active_widgets, bridge)
+    if Log then
+        pcall(function() Log.info("dispatcher bridge attached to ui.active_widgets") end)
+    end
+    return true
+end
+
+-- ============================================================================
+-- 把拆分到 reading/*.lua 的方法合并回插件类（同名 mixin）。
+-- 方法名与调用约定与拆分前完全一致，因此本文件其余地方与其它模块里的
+-- `self:xxx()` 调用点都无需改动。详见架构报告 §9-2 / P0-6。
+-- ============================================================================
+for ___, mod_name in ipairs({
+    "reading.toc_align",
+    "reading.progress",
+    "reading.book_detail",
+    "reading.downloader",
+    "reading.menus",
+    "reading.lifecycle",
+}) do
+    local mod = require(mod_name)
+    for method_name, fn in pairs(mod) do
+        ReadingPlugin[method_name] = fn
+    end
+end
 
 function ReadingPlugin:isCurrentDocReading()
     if not (self.ui and self.ui.document) then return false end
@@ -108,15 +187,9 @@ function ReadingPlugin:_detect_current_book()
         Log.debug("检测到打开的书籍文件: " .. doc_path .. ", 书名: " .. book_name)
 
         local books = self.bookshelf:get_books()
-        -- ReaderUI 实例的 bookshelf 默认为空（init 不加载缓存），
-        -- 这里按需加载缓存，确保能匹配到当前书籍并恢复 current_book（进度同步依赖此）。
-        if #books == 0 then
-            local cached = self.bookshelf:load_bookshelf_cache()
-            if cached and #cached > 0 then
-                books = cached
-                Log.info("ReaderUI 实例按需加载书架缓存: " .. #books .. " 本书")
-            end
-        end
+        -- 单例下书架缓存已在 Store.get() 内加载完毕，这里直接取权威内存副本。
+        -- （P0-4：原先「ReaderUI 实例 books 为空则按需重新加载缓存」的补丁
+        --   是双实例状态分裂的症状，已随单例化一并移除。）
 
         -- 优先用哈希索引 O(1) 精确匹配
         local matched = self.bookshelf:get_book_by_name(book_name)
@@ -148,16 +221,10 @@ function ReadingPlugin:onReaderReady()
     self:_detect_current_book()
 
     if Context.get_current_epub_path() then
-        Log.info("阅读界面就绪，章节变化时将自动异步上传进度")
+        Log.info("阅读界面就绪，位置变化停止满去抖窗口后将自动异步上传进度")
 
         -- 阅读器就绪后加载章节，并执行 pending_jump（如果有）
         self:_load_chapters_from_document()
-
-        -- 初始化已上传章节标记为当前章节，避免进入阅读时立即触发上传
-        local book = Context.get_current_book()
-        if book then
-            self._last_synced_chapter = book.durChapterIndex
-        end
 
         -- 进入阅读界面时自动拉取云端进度并对比
         self:_auto_pull_and_compare()
@@ -165,538 +232,223 @@ function ReadingPlugin:onReaderReady()
 end
 
 function ReadingPlugin:onDispatcherRegisterActions()
-    -- 将“开源阅读书架”注册到 KOReader 的手势/按键派发器中
+    -- 「书架」注册到 KOReader 的手势/按键派发器中。
+    -- 用 general：文件管理器（主页面）与阅读界面都用得上它 —— 阅读中想换书也说得通。
+    -- （不要再加 filemanager = true：section 列表里 general 与 filemanager 各列一次，
+    --   两个都为 true 会让同一动作在手势菜单里重复出现两项。）
+    --
+    -- ⚠️ 动作名 "reading_show_bookshelf" 自 4054c04（首个提交）以来从未变过。
+    -- 用户在手势菜单里绑定的就是这个名字，**改名会让所有既有手势绑定失效**
+    -- （Dispatcher:execute 查不到动作名只会静默跳过），属破坏性变更。
     Dispatcher:registerAction("reading_show_bookshelf", {
         category = "none",
         event = "ReadingShowBookshelf",
         title = _("开源阅读：书架"),
         general = true,
     })
-    
-    -- 将“拉取进度”和“覆盖云端”注册到手势/按键派发器中
+
+    -- ⚠️ 「拉取进度」「覆盖云端」必须只在**阅读界面**注册（reader = true，而**不是** general）。
+    --
+    -- 这两个动作都以「当前正在阅读的那本书」为操作对象，在文件管理器里没有意义：
+    -- pull_cloud_progress 第一行就是 `if not Context.get_current_book() then return end`，
+    -- 在主页面上点它只会「毫无反应」。此前它们用的是 general = true，于是 FileManager 的
+    -- 手势/按键菜单里也会列出这两项 —— 等于把「阅读中才成立的动作」注册到了主页面。
+    --
+    -- 上游的惯例也是按这个划分（frontend/dispatcher.lua:167-181）：
+    -- 依赖 ReaderUI 的动作一律 reader = true（toggle_status_bar / prev_chapter / go_to …），
+    -- 依赖 FileManager 的才用 filemanager = true（set_display_mode / folder_up …）。
+    --
+    -- 注：Dispatcher:registerAction 只在 settingsList[name] == nil 时写入，
+    -- 所以本次改动需要**重启 KOReader** 才会在菜单里生效。
     Dispatcher:registerAction("reading_pull_progress", {
         category = "none",
         event = "ReadingPullProgress",
         title = _("开源阅读：拉取进度"),
-        general = true,
+        reader = true,
     })
-    
+
     Dispatcher:registerAction("reading_push_progress", {
         category = "none",
         event = "ReadingPushProgress",
         title = _("开源阅读：覆盖云端"),
-        general = true,
+        reader = true,
     })
 end
 
+-- ⚠️ 这三个 onXxx 是**用户手势/按键直接触发的入口**，必须整体用 _guard 包住：
+-- 插件里任何一处抛错，在派发器动作里都是「KOReader 整个进程崩掉」
+-- （2026-09-30 实测：本动作绑成手势后一点就 ./luajit: ... attempt to call method
+--  'showBookshelf' (a nil value)，正在读的书一起没了、要重新启动）。
+-- _guard 会把异常降级成一条「xx 失败:<原因>」提示 + 一条 ERROR 日志。
 function ReadingPlugin:onReadingShowBookshelf()
-    -- 延迟执行以确保从阅读界面或其他状态安全切换
-    UIManager:scheduleIn(0.1, function()
-        self:showBookshelf()
-    end)
+    -- 延迟执行以确保从阅读界面或其他状态安全切换。
+    -- 入口是 self:show()（与主菜单「开源阅读 → 书架」同一入口，见 menus.lua 的
+    -- getMainMenuItems）——**不是** showBookshelf。这段派发代码是照 koobone
+    -- 抄的，那边的方法恰好叫 showBookshelf，而本插件的方法名是 show，改名时
+    -- 漏了这一处，于是这个动作从来没能用过（备份里的 134KB 单体版同样如此）。
+    -- 语法/自由变量/可达性/模块字段四项检查都看不见这种错：
+    -- `self:foo()` 里的 foo 是「字段查找」，不是自由变量，也不是模块表的字段。
+    UIManager:scheduleIn(0.1, self:_guard(_("打开书架"), function()
+        self:show()
+    end))
     return true
 end
 
 function ReadingPlugin:onReadingPullProgress()
-    UIManager:scheduleIn(0.1, function()
+    UIManager:scheduleIn(0.1, self:_guard(_("拉取进度"), function()
+        -- 守卫：必须有「当前正在阅读的书」。
+        -- 该动作现在只在阅读界面注册，但旧版本可能已经把 general 版绑到了手势上，
+        -- 那种残留配置下会走到这里；没有守卫的话 pull_cloud_progress 第一行就
+        -- 静默 return，用户看到的是「点了没反应」。
+        if not Context.get_current_book() then
+            self:showInfo(_("请先在开源阅读书架中打开一本书"), false)
+            return
+        end
         self:pull_cloud_progress()
-    end)
+    end))
     return true
 end
 
 function ReadingPlugin:onReadingPushProgress()
-    UIManager:scheduleIn(0.1, function()
+    UIManager:scheduleIn(0.1, self:_guard(_("覆盖云端"), function()
+        if not Context.get_current_book() then
+            self:showInfo(_("请先在开源阅读书架中打开一本书"), false)
+            return
+        end
         self:push_cloud_progress()
-    end)
+    end))
     return true
 end
 
+-- ⚠️ 【为什么拆成 init + _init_modules：一个会「静默弄哑整个插件」的 KOReader 语义】
+--
+-- 上游创建插件实例的链路（已逐行核对）：
+--   frontend/pluginloader.lua:479  PluginLoader:createPluginInstance(plugin, attr)
+--                                  → local ok, re = pcall(plugin.new, plugin, attr)
+--   frontend/ui/widget/widget.lua:40  Widget:new(o) → if o.init then o:init() end
+-- 合起来：**init() 里任何一处抛错，插件实例根本不会被创建**，只留下
+--   logger.err("Failed to initialize", "<插件名>", "<错误>")
+-- 一行日志，且不会弹给用户。
+--
+-- 用户侧的现象：插件主菜单消失 + 它注册的手势/按键动作消失；而 Dispatcher:execute 查到
+-- 不存在的动作名时是**静默跳过**的（frontend/dispatcher.lua:1504 的
+-- `if Dispatcher:isActionEnabled(settingsList[k])`，settingsList[k] == nil → 直接不执行、
+-- 不报错）→ 表现为「首页手势点了没反应」。
+--
+-- 本插件原先 `Store.get()` 排在注册之前：store.lua 里要构造 Settings/Sync/Bookshelf/
+-- ReadRecord 并读盘，任何一处因设备环境（配置损坏、目录不可写）抛错，都会顺手把
+-- 「打开书架」这个动作一起弄哑。故拆开：
+--   ① 动作注册最先，且不依赖任何模块（自身再包一层 pcall）；
+--   ② 模块构造（含 Store.get()）整段 pcall，失败只降级为「插件不可用但仍在」；
+--   ③ 主菜单注册单独 pcall。
 function ReadingPlugin:init()
-    self.settings = Settings:new()
-    
-    local H = require("reading.helper")
-    Log.init(H.get_data_dir() .. "/reading.log")
-    
-    self.sync = Sync:new(self.settings)
-    self.bookshelf = Bookshelf:new(self.settings)
-    self.read_record = ReadRecord:new(self.settings)
-    
-    -- 章节变化触发的进度上传：记录上次已上传的章节索引，避免同章内重复上传
-    self._last_synced_chapter = nil
-    
-    -- 用于管理当前正在运行的异步任务的句柄集合
-    self._async_handles = {}
-    
-    if self.ui and self.ui.menu then
-        self.ui.menu:registerToMainMenu(self)
+    pcall(function() self:onDispatcherRegisterActions() end)
+
+    -- 让「首页被别的控件遮住」时也能收到 Dispatcher 派发的动作事件
+    -- （原理见文件上方 ensure_dispatch_reachable 的注释）。
+    -- 放在最前、且自身 pcall：它只做一次 table.insert，永远不会影响插件加载。
+    pcall(function() ensure_dispatch_reachable(self) end)
+
+    local ok_init, err_init = pcall(function() self:_init_modules() end)
+    if not ok_init then
+        self._init_error = tostring(err_init)
+        pcall(function() Log.error("init 失败，插件降级为不可用：" .. tostring(err_init)) end)
     end
-    
-    self:onDispatcherRegisterActions()
-    
+
+    if self.ui and self.ui.menu then
+        pcall(function() self.ui.menu:registerToMainMenu(self) end)
+    end
+
     Log.info("开源阅读插件初始化完成")
 end
 
-function ReadingPlugin:showBusy(text)
-    -- 使用 UIHandles 共享句柄，确保 FileManager 和 ReaderUI 实例都能关闭 busy 消息
-    UIHandles.set("busy_msg", InfoMessage:new{ text = text, norefresh = true })
-    UIManager:show(UIHandles.get("busy_msg"))
-    UIManager:forceRePaint()
-end
+-- 真正做初始化（原 init 主体，逐字保留）。
+function ReadingPlugin:_init_modules()
+    -- 状态收敛到进程级单例（架构报告 §9-1 / P0-4）：
+    -- FileManager 与每个 ReaderUI 实例共享同一份 settings / sync / bookshelf / read_record，
+    -- 不再各自持有一套内存模型去并发读写同一批磁盘文件。
+    local store = Store.get()
+    self.settings = store.settings
+    self.sync = store.sync
+    self.bookshelf = store.bookshelf
+    self.read_record = store.read_record
 
-function ReadingPlugin:closeBusy()
-    UIHandles.close("busy_msg")
-end
+    -- 去抖上传的辅助状态（实例私有，见 reading/store.lua 顶部说明）：
+    --   _last_seen_chapter / _last_seen_page：上一次位置回调观察到的章节与页码，
+    --     用于判断「页码是否真的变了」，只有真的变了才重置去抖窗口；
+    --   _pending_progress_upload：待执行的去抖上传定时器句柄（闭包引用，
+    --     UIManager:unschedule 按函数引用匹配 —— scheduleIn 无返回值，只能自己存）。
+    --   _pending_auto_compare：待执行的自动对比任务句柄（同上）。
+    --     有两个触发点（打开书 / 回到前台），靠它在 onResume 连发时只保留最后一次。
+    self._last_seen_chapter = nil
+    self._last_seen_page = nil
+    self._pending_progress_upload = nil
+    self._pending_auto_compare = nil
+    -- 详情页身份令牌：每次 show_book_detail 自增，异步回调据此判断
+    -- 「这份云端检查结果还属不属于当前这本书的详情页」（见 book_detail.lua）。
+    self._detail_token = 0
 
-function ReadingPlugin:showInfo(text)
-    UIManager:show(InfoMessage:new{ text = text })
-end
+    -- 书架搜索关键字（会话级，不持久化）：书架左上角菜单「搜索」设置。
+    -- 刻意放实例上而不是 settings —— 搜索是临时意图，重启 KOReader 后回到全量书架。
+    self._shelf_filter_text = nil
 
---- 统一错误展示：closeBusy + log + showInfo
-function ReadingPlugin:showError(label, err)
-    self:closeBusy()
-    local fmt_err = Result and Result.format_error(err) or tostring(err)
-    Log.error(label .. " 失败: " .. fmt_err)
-    self:showInfo(T(_("%1 failed:\n%2"), label, fmt_err))
-end
+    -- 书架渲染令牌（stale-while-revalidate 用）：每次 show() 自增。
+    -- 后台静默刷新完成时用它判断「书架还是不是刚才那一次渲染」——不一致就说明用户
+    -- 已经切走 / 又重新渲染过，此时重渲染会把用户当前看到的那一份冲掉。
+    self._shelf_token = 0
+    -- 上一次真正渲染出来的「内容键」（见 show() 的渲染去重）：键相同 + 菜单还在最上层
+    -- 就不再重画。置 nil 表示「还不知道屏幕上是什么」，第一次 show() 必定渲染。
+    self._shelf_last_content_key = nil
+    -- 后台刷新「进行中」的时间戳（**不是**布尔，理由见 _maybe_bg_revalidate_shelf）。
+    self._bg_refresh_started_at = nil
 
---- 统一的同步完成处理：更新书架 + 保存缓存 + 合并阅读记录 + 刷新 UI
--- @param sync_data table  { books, book_sources, replace_rules, read_records }
-function ReadingPlugin:_complete_sync(sync_data)
-    if not sync_data then return end
+    -- 用于管理当前正在运行的异步任务的句柄集合。
+    -- 刻意保持「实例级」：onClose 会无条件 _cancel_async() 取消本实例全部任务，
+    -- 若共享则关闭阅读器会误杀书架实例正在跑的下载（见 reading/store.lua 顶部说明）。
+    self._async_handles = {}
 
-    self.bookshelf:apply_sync_data(sync_data)
-    self.bookshelf:save_bookshelf_cache(self.bookshelf:get_books())
+    -- 正在进行的「书籍下载」会话（**单槽位**）：{ handle=, progress=, on_dispose= }。
+    -- 详情页「下载/更新书籍」与云端书库「下载」两条入口共用它 —— 此前各存各的字段
+    -- （_download_epub_handle / _download_handle），互相取消不到，同一本书会起两个
+    -- 子进程往同一个 save_path 写、并留下两个进度窗。见 downloader 文件顶部的
+    -- 「书籍下载会话」一节。
+    self._book_download = nil
 
-    local records = sync_data.read_records or {}
-    if #records > 0 then
-        local updated_count = self.read_record:merge_from_sync(records)
-        self:showInfo(T(_("同步成功，更新了 %1 条阅读记录"), updated_count))
-    else
-        self:showInfo(_("同步成功"))
+    -- 缓存 LRU 清理（上限 + 过期）。**延迟到启动 5 秒之后**再跑：
+    -- 插件 init 处在「插件加载 → UI 起来」这段最敏感的窗口里，而清理要遍历若干目录
+    -- （几万次 lfs.attributes），放在这里会实打实地拖慢启动。内部还有进程级与
+    -- 12 小时两道短路，不会反复扫盘。
+    if UIManager then
+        UIManager:scheduleIn(5, function()
+            pcall(function() self:cleanup_caches() end)
+        end)
     end
 
-    if UIHandles.get("menu") then
-        UIManager:close(UIHandles.get("menu"))
-    end
-    self:show()
-end
-
---- 统一的回调保护包装器（替代原 safeCallback 和 _safeAsync）
--- @param label 描述（日志和错误提示用）
--- @param callback 实际函数
--- @return 包装后的函数，接受任意参数
-function ReadingPlugin:_guard(label, callback)
-    local self_ref = self
-    return function(...)
-        local args = { ... }
-        local ok, err = xpcall(function()
-            return callback(unpack_args(args))
-        end, function(err) return tostring(err) end)
-        if not ok then
-            self_ref:showError(label, err)
-        end
-    end
-end
-
---- 异步执行 work_func（在子进程中），完成后在 UI 线程回调 on_done(ok, result, err)。
---- Async 模块不可用时自动降级为 scheduleIn 同步执行（仍会短暂阻塞 UI）。
---- @param work_func function  子进程中执行的无参闭包，返回可 JSON 序列化值
---- @param on_done function|nil  回调 function(ok, result, err)
---- @param opts table|nil  { timeout=60, poll_interval=0.125, delay=0 }
-function ReadingPlugin:_async_run(work_func, on_done, opts)
-    -- 包装 on_done 以捕获回调异常（回调在 UI 线程执行，异常不应中断 UIManager）
-    local safe_on_done = nil
-    local handle_id = tostring(os.clock()) .. "_" .. tostring(math.random(10000, 99999))
-    local self_ref = self
-    
-    if on_done then
-        safe_on_done = function(ok, result, err)
-            -- 任务完成后清理句柄引用
-            if self_ref._async_handles then
-                self_ref._async_handles[handle_id] = nil
-            end
-            
-            local call_ok, call_err = xpcall(function()
-                on_done(ok, result, err)
-            end, function(e) return tostring(e) end)
-            if not call_ok then
-                Log.error("_async_run 回调异常: " .. call_err)
-            end
-        end
-    else
-        safe_on_done = function()
-            if self_ref._async_handles then
-                self_ref._async_handles[handle_id] = nil
-            end
-        end
-    end
-    
-    if Async and Async.run then
-        local handle = Async.run(work_func, safe_on_done, opts)
-        if handle and self._async_handles then
-            self._async_handles[handle_id] = handle
-        end
-        return handle
-    end
-    -- 降级：scheduleIn 同步执行（UI 线程阻塞）
-    opts = opts or {}
-    UIManager:scheduleIn(opts.delay or 0, function()
-        local ok, result = pcall(work_func)
-        if safe_on_done then
-            if ok then safe_on_done(true, result, nil)
-            else safe_on_done(false, nil, tostring(result)) end
-        end
-    end)
-    return nil
-end
-
---- 取消特定的异步任务或所有任务
-function ReadingPlugin:_cancel_async(handle_or_id)
-    if not self._async_handles then return end
-    
-    if handle_or_id == nil then
-        -- 取消所有任务
-        for id, handle in pairs(self._async_handles) do
-            if type(handle) == "table" and type(handle.cancel) == "function" then
-                pcall(handle.cancel)
-            end
-        end
-        self._async_handles = {}
-    elseif type(handle_or_id) == "string" then
-        -- 按 ID 取消
-        local handle = self._async_handles[handle_or_id]
-        if handle and type(handle) == "table" and type(handle.cancel) == "function" then
-            pcall(handle.cancel)
-            self._async_handles[handle_or_id] = nil
-        end
-    elseif type(handle_or_id) == "table" and type(handle_or_id.cancel) == "function" then
-        -- 直接通过句柄取消
-        pcall(handle_or_id.cancel)
-        -- 尝试从集合中移除
-        for id, h in pairs(self._async_handles) do
-            if h == handle_or_id then
-                self._async_handles[id] = nil
-                break
-            end
-        end
+    -- 更新自检 + 启动后的自动检查。
+    -- KOReader 会给 FileManager 与每个 ReaderUI 各 new 一个 Plugin，init 会被多次调用 ——
+    -- 去重交给 updater_ui 内部的进程级标志（模块级 local 在同一 Lua VM 内共享）。
+    -- 这里必须 pcall：本段跑在 init 内部，抛错会让整个插件不被加载（见 init 顶部注释）。
+    if UpdaterUI then
+        pcall(function() UpdaterUI.startup(self) end)
     end
 end
 
-function ReadingPlugin:getSettingsMenuItems()
-    -- 直接展开 WebDAV 设置，去除多余的"同步文件链接"层级
-    return self:getWebDAVMenuItems()
-end
-
-function ReadingPlugin:getWebDAVMenuItems()
-    local server = self.settings:get_webdav_server()
-    local username = self.settings:get_webdav_username()
-    local password = self.settings:get_webdav_password()
-    local remote_path = self.settings:get_webdav_remote_path()
-    
-    local display_username = username and username ~= "" and username or "未设置"
-    local display_server = server and server ~= "" and server or "未设置"
-    local display_remote_path = remote_path and remote_path ~= "" and remote_path or "未设置"
-    
-    return {
-        {
-            text = _("使用 config.lua 配置（推荐）"),
-            separator = true,
-        },
-        {
-            text = _("重新加载 config.lua"),
-            keep_menu_open = true,
-            callback = function()
-                local ok = self.settings:reload_config()
-                if ok then
-                    self:showInfo(_("config.lua 已重新加载"))
-                else
-                    self:showInfo(_("config.lua 加载失败，请检查文件是否存在"))
-                end
-            end,
-        },
-        {
-            text = _("界面设置（仅当前设备有效）"),
-            separator = true,
-        },
-        {
-            text = T(_("服务器: %1"), display_server),
-            keep_menu_open = true,
-            callback = function()
-                self:show_webdav_input_dialog("server", server, "请输入 WebDAV 服务器地址")
-            end,
-        },
-        {
-            text = T(_("用户名: %1"), display_username),
-            keep_menu_open = true,
-            callback = function()
-                self:show_webdav_input_dialog("username", username, "请输入 WebDAV 用户名")
-            end,
-        },
-        {
-            text = _("密码: ******"),
-            keep_menu_open = true,
-            callback = function()
-                self:show_webdav_input_dialog("password", password, "请输入 WebDAV 密码")
-            end,
-        },
-        {
-            text = T(_("远程路径: %1"), display_remote_path),
-            keep_menu_open = true,
-            callback = function()
-                self:show_webdav_input_dialog("remote_path", remote_path, "请输入远程路径")
-            end,
-        },
-        {
-            text = _("测试连接"),
-            keep_menu_open = true,
-            callback = function()
-                self:test_webdav_connection()
-            end,
-        },
-        {
-            text = _("选择备份文件同步"),
-            keep_menu_open = true,
-            callback = function()
-                self:show_webdav_file_list()
-            end,
-        },
-    }
-end
-
-function ReadingPlugin:getLogMenuItems()
-    return {
-        {
-            text = _("查看日志文件"),
-            callback = function()
-                self:view_log()
-            end,
-        },
-        {
-            text = _("调试日志"),
-            checked_func = function()
-                return Log.is_debug_enabled()
-            end,
-            callback = function()
-                local new_state = not Log.is_debug_enabled()
-                Log.set_debug_enabled(new_state)
-                self:showInfo(new_state and _("调试日志已开启") or _("调试日志已关闭"))
-            end,
-        },
-        {
-            text = _("清除日志"),
-            callback = function()
-                Log.clear_log()
-                self:showInfo(_("日志已清除"))
-            end,
-        },
-    }
-end
-
-function ReadingPlugin:show_sync_url_dialog()
-    local current_url = self.settings:get_sync_url()
-    local dialog
-    dialog = InputDialog:new{
-        title = _("同步文件链接"),
-        input = current_url,
-        buttons = {
-            {
-                {
-                    text = _("取消"),
-                    callback = function()
-                        UIManager:close(dialog)
-                    end,
-                },
-                {
-                    text = _("保存"),
-                    is_enter_default = true,
-                    callback = function()
-                        local url = dialog:getInputText()
-                        self.settings:set_sync_url(url)
-                        UIManager:show(InfoMessage:new{
-                            text = _("设置已保存"),
-                        })
-                        UIManager:close(dialog)
-                    end,
-                },
-            },
-        },
-    }
-    UIManager:show(dialog)
-    dialog:onShowKeyboard()
-end
-
-function ReadingPlugin:show_webdav_input_dialog(field, current_value, hint)
-    Log.debug("打开WebDAV设置对话框: " .. field .. ", 当前值: " .. tostring(current_value))
-    local dialog
-    dialog = InputDialog:new{
-        title = _("WebDAV " .. field),
-        input = current_value,
-        input_hint = hint,
-        buttons = {
-            {
-                {
-                    text = _("取消"),
-                    callback = function()
-                        UIManager:close(dialog)
-                    end,
-                },
-                {
-                    text = _("保存"),
-                    is_enter_default = true,
-                    callback = function()
-                        local value = dialog:getInputText()
-                        Log.debug("保存WebDAV设置: " .. field .. " = " .. tostring(value))
-                        if field == "server" then
-                            self.settings:set_webdav_server(value)
-                        elseif field == "username" then
-                            self.settings:set_webdav_username(value)
-                        elseif field == "password" then
-                            self.settings:set_webdav_password(value)
-                        elseif field == "remote_path" then
-                            self.settings:set_webdav_remote_path(value)
-                        end
-                        
-                        UIManager:show(InfoMessage:new{
-                            text = _("设置已保存"),
-                        })
-                        UIManager:close(dialog)
-                    end,
-                },
-            },
-        },
-    }
-    UIManager:show(dialog)
-    dialog:onShowKeyboard()
-end
-
-function ReadingPlugin:test_webdav_connection()
-    self:showBusy(_("正在测试连接..."))
-    local sync_ref = self.sync
-    local self_ref = self
-    self:_async_run(
-        function()
-            local ok, _, err = sync_ref:test_webdav_connection()
-            return { ok = ok, err = err }
-        end,
-        function(ok, result, err)
-            self_ref:closeBusy()
-            if ok and result and result.ok then
-                self_ref:showInfo(_("WebDAV 连接成功"))
-            else
-                self_ref:showInfo(T(_("WebDAV 连接失败:\n%1"), err or (result and result.err)))
-            end
-        end,
-        { timeout = 30 }
-    )
-end
-
-function ReadingPlugin:sync_from_webdav_auto()
-    Log.info("执行一键同步（从WebDAV自动拉取最新备份）")
-    self:showBusy(_("正在同步..."))
-    local sync_ref = self.sync
-    local self_ref = self
-    self:_async_run(
-        function()
-            local ok, __, err = sync_ref:sync_from_webdav()
-            if not ok then
-                return { ok = false, err = err }
-            end
-            return { ok = true, data = sync_ref:get_sync_data() }
-        end,
-        function(ok, result, err)
-            self_ref:closeBusy()
-            if not ok or not result or not result.ok then
-                local err_msg = tostring(err or (result and result.err) or _("未知错误"))
-                self_ref:showInfo(_("同步失败: ") .. err_msg)
-                return
-            end
-            self_ref:_complete_sync(result.data)
-        end,
-        { timeout = 60 }
-    )
-end
-
-function ReadingPlugin:show_webdav_file_list()
-    Log.info("显示WebDAV文件列表")
-    self:showBusy(_("正在连接..."))
-
-    local sync_ref = self.sync
-    local self_ref = self
-    self:_async_run(
-        function()
-            local ok2, items, err2 = sync_ref.webdav:list("")
-            if not ok2 then
-                return { ok = false, err = err2 or _("列出文件失败") }
-            end
-            return { ok = true, items = items }
-        end,
-        function(ok, result, err)
-            self_ref:closeBusy()
-            if not ok or not result or not result.ok then
-                local err_msg = tostring(err or (result and result.err) or _("未知错误"))
-                self_ref:showInfo(_("WebDAV 连接失败:\n") .. err_msg)
-                return
-            end
-            ShelfView.show_webdav_file_list(sync_ref.webdav, function(filename, url)
-                self_ref:perform_sync_from_file(filename, url)
-            end)
-        end,
-        { timeout = 30 }
-    )
-end
-
-function ReadingPlugin:perform_sync_from_file(filename, url)
-    -- 双重保险：确保文件列表对话框关闭（即使 callback 中关闭失败，这里也处理）
-    if UIHandles.get("webdav_file_list") then
-        UIManager:close(UIHandles.get("webdav_file_list"))
-        UIHandles.clear("webdav_file_list")
-    end
-    Log.info("开始同步文件: " .. filename)
-    local self_ref = self
-    local sync_ref = self.sync
-    local sync_dir = H.get_sync_dir()
-
-    self:showBusy(_("正在下载与解析..."))
-    self:_async_run(
-        function()
-            local ok, content = sync_ref.webdav:get_file(url)
-            if not ok then
-                return { ok = false, err = content }
-            end
-
-            if filename:match("%.zip$") then
-                H.make_dir(sync_dir)
-                local zip_path = H.join_path(sync_dir, "sync_backup.zip")
-                local file = io.open(zip_path, "wb")
-                if not file then
-                    return { ok = false, err = _("无法保存文件") }
-                end
-                file:write(content)
-                file:close()
-
-                local ok2, extract_dir = sync_ref:extract_zip(zip_path)
-                if not ok2 then
-                    return { ok = false, err = T(_("解压失败:\n%1"), extract_dir) }
-                end
-                sync_ref:load_from_extracted_dir(extract_dir)
-            else
-                local files = sync_ref:parse_backup(content)
-                sync_ref:load_from_files(files)
-            end
-
-            return { ok = true, data = sync_ref:get_sync_data() }
-        end,
-        function(ok, result, err)
-            self_ref:closeBusy()
-            if not ok or not result or not result.ok then
-                local err_msg = tostring(err or (result and result.err) or _("未知错误"))
-                self_ref:showInfo(_("同步失败:\n") .. err_msg)
-                return
-            end
-            self_ref:_complete_sync(result.data)
-        end,
-        { timeout = 60 }
-    )
+--- 当前应当渲染的书架「内容键」。
+--
+-- 由「书籍数据指纹 + 所有会影响列表的输入」拼成：搜索关键字、排序键与方向、
+-- 「仅显示已下载」。书籍数据部分复用 downloader.shelf_signature（已排序后再拼串，
+-- 因此「顺序变化」不算内容变化 —— 顺序由排序键决定，已单独计入）。
+--
+-- 用途只有一个：show() 的**渲染去重**（见下）。键相同但显示不同是不可能的，
+-- 因此它可以安全地用于「是否值得重画一屏」的判断。
+function ReadingPlugin:_shelf_content_key()
+    return table.concat({
+        self:shelf_signature(self.bookshelf:get_books()),
+        tostring(self._shelf_filter_text or ""),
+        tostring(self.settings:get_shelf_sort()),
+        tostring(self.settings:get_shelf_sort_asc()),
+        tostring(self.settings:get_show_downloaded_only()),
+    }, "|")
 end
 
 function ReadingPlugin:show()
@@ -707,12 +459,32 @@ function ReadingPlugin:show()
     local cached_books = self.bookshelf:load_bookshelf_cache()
     Log.info("show() load_bookshelf_cache 返回: " .. (cached_books and #cached_books or "nil") .. " 本")
 
+    -- 【渲染去重（墨水屏节流）】书架还没关、仍在最上层，且内容键与屏幕上那一份
+    -- 完全相同时，直接返回 —— 再走一遍是「拆掉旧菜单 + 新建菜单 + 全屏重画」，
+    -- 在墨水屏上有可见闪烁，而且会把用户翻到的页码打回第一页，纯亏。
+    --
+    -- 三条同时成立才跳过：句柄还在（菜单没被关掉）+ 内容键未变 + 就在最上层
+    -- （被详情页/对话框盖住时不能跳过：那种情况下调用方要的是「把书架抬到前面」）。
+    local content_key = self:_shelf_content_key()
+    local current_menu = UIHandles.get("menu")
+    if current_menu and content_key == self._shelf_last_content_key
+        and self:is_widget_on_top(current_menu) then
+        Log.info("show() 内容与当前渲染一致且书架在最上层，跳过重渲染")
+        return
+    end
+    self._shelf_last_content_key = content_key
+
+    -- 【书架渲染令牌】本次渲染的「身份」。后台静默刷新回来时比对它，
+    -- 只有「还是这一次渲染」才允许原地换数据（见 _maybe_bg_revalidate_shelf）。
+    self._shelf_token = (self._shelf_token or 0) + 1
+    local shelf_token = self._shelf_token
+
     local books = self.bookshelf:get_books()
     Log.info("show() get_books 返回: " .. #books .. " 本")
 
     -- 构建阅读记录查找表（O(1) 替代原线性查找）
     local record_index = {}
-    for _, rec in ipairs(self.read_record.records) do
+    for __, rec in ipairs(self.read_record.records) do
         if rec.bookName then
             record_index[rec.bookName:lower()] = rec
         end
@@ -733,2218 +505,108 @@ function ReadingPlugin:show()
     self.bookshelf:sort_books()
 
     -- 从已排序的 books 构建 valid_books，保持排序顺序，同时进行 去重
-    local valid_books = {}
-    local seen_keys = {}
     local show_downloaded_only = self.settings:get_show_downloaded_only()
-    
-    for ___, book in ipairs(books) do
-        local title = book.name or book.title or ""
-        local author = book.author or ""
-        local unique_key = title .. "|" .. author
-        local url = book.bookUrl or ""
-        
-        if title ~= "" and url ~= "" and not seen_keys[unique_key] then
-            local should_add = true
-            if show_downloaded_only then
-                local epub_path = self.bookshelf:get_epub_for_book(book)
-                if not epub_path then
+
+    -- P1-7：原实现对每本书调 get_epub_for_book，每次都对本地文件列表跑一遍 O(M) 匹配，
+    -- 整体 O(N×M)。这里预建一次索引，查询降到 O(1) 查表（详见 Bookshelf:build_downloaded_index）。
+    local downloaded_index = nil
+    if show_downloaded_only then
+        downloaded_index = self.bookshelf:build_downloaded_index()
+    end
+
+    -- 书架搜索（会话级，见 init 里 _shelf_filter_text 的说明）：
+    -- 匹配书名或作者，大小写不敏感、按字面匹配（find 第 4 参 true），
+    -- 文件名/书名里的 . ( ) 等不会被当 pattern 元字符。
+    local filter_kw = nil
+    if self._shelf_filter_text and self._shelf_filter_text ~= "" then
+        filter_kw = string.lower(self._shelf_filter_text)
+    end
+
+    -- 去重 + 「仅显示已下载」+ 搜索过滤 的统一实现。
+    -- 这段循环原本被复制了两份（第二份用于「搜索把所有书都滤掉」时的回退重跑），
+    -- 二者只差是否套用搜索关键字 —— 合并成一个函数，filter 传关键字或 nil。
+    local function collect_valid_books(filter)
+        local out = {}
+        local seen = {}
+        for ___, book in ipairs(books) do
+            local title = book.name or book.title or ""
+            local author = book.author or ""
+            local unique_key = title .. "|" .. author
+            local url = book.bookUrl or ""
+
+            if title ~= "" and url ~= "" and not seen[unique_key] then
+                local should_add = true
+                if show_downloaded_only and not downloaded_index[title] then
                     should_add = false
                 end
-            end
-            
-            if should_add then
-                seen_keys[unique_key] = true
-                valid_books[#valid_books + 1] = book
+                if should_add and filter then
+                    local hay = string.lower(title .. "\0" .. author)
+                    if not string.find(hay, filter, 1, true) then
+                        should_add = false
+                    end
+                end
+
+                if should_add then
+                    seen[unique_key] = true
+                    out[#out + 1] = book
+                end
             end
         end
+        return out
     end
+
+    local valid_books = collect_valid_books(filter_kw)
+
+    if filter_kw and #valid_books == 0 then
+        -- 搜索把所有书都滤掉了：提示并自动清除搜索（书架不比云端列表，
+        -- 没有「保留旧列表」可言——show() 是全新渲染，困在空书架里连菜单都点不到几本书）。
+        Log.info("show() 搜索 '" .. filter_kw .. "' 无匹配，清除搜索显示全部")
+        self:showInfo(T(_("没有匹配「%1」的书籍，已显示全部"), self._shelf_filter_text))
+        self._shelf_filter_text = nil
+        filter_kw = nil
+        -- 回退：重跑一遍不带筛选的收集
+        valid_books = collect_valid_books(nil)
+    end
+
     books = valid_books
     Log.info("show() valid_books 去重过滤后: " .. #books .. " 本，准备显示书架")
-    
+
+    -- 搜索生效时标题栏带 [关键字]（与云端书库筛选的显示约定一致）
+    local shelf_title = _("书架")
+    if filter_kw then
+        shelf_title = shelf_title .. " [" .. self._shelf_filter_text .. "]"
+    end
+
     UIHandles.set("menu", ShelfView.show{
+        -- ⚠️ 这里只允许出现 ShelfView.show 真正消费的键（见 shelf_view.lua 顶部契约注释）。
+        -- 历史上曾传入 bookshelf / settings / on_sync / on_sync_books / on_settings，
+        -- 而 ShelfView 一个都没读 —— 于是 on_sync_books 指向的 sync_epub_files（129 行）
+        -- 成了「传了但永远不会被调用」的死代码。传参式接口写错名字不会报错，
+        -- 只会静默失效，所以新增键时必须同时改 shelf_view.lua。
         books = books,
-        bookshelf = self.bookshelf,
-        settings = self.settings,
+        title = shelf_title,
         on_select = function(book)
             self:show_book_detail(book)
         end,
-        on_sync = function()
-            self:show_webdav_file_list()
-        end,
-        on_sync_books = function()
-            self:sync_epub_files()
-        end,
         on_left_button_tap = function(menu_instance)
             self:show_sort_dialog(menu_instance)
-        end,
-        on_settings = function()
-            -- Settings are in main menu now
-            if UIHandles.get("menu") then
-                UIManager:close(UIHandles.get("menu"))
-            end
         end,
         on_close = function()
             UIHandles.clear("menu")
         end,
     })
-    UIHandles.set("active_menu", UIHandles.get("menu"))
-end
+    -- 不再另设 active_menu 句柄：它永远与 menu 同指同一个 widget，而 UIHandles.set
+    -- 在注册同名句柄时会先关掉旧值 —— 于是「打开书架」这一步会对刚刚被
+    -- set("menu", ...) 关掉的旧菜单**再 close 一次**（UIManager:close 在窗口栈里
+    -- 找不到它，但照样发 FlushSettings + CloseWidget）。
+    -- 需要「当前书架菜单」的地方一律用 UIHandles.get("menu")。
 
-function ReadingPlugin:show_sort_dialog(menu_instance)
-    local ButtonDialog = require("ui/widget/buttondialog")
-    local current_sort = self.settings:get_shelf_sort()
-    local show_downloaded_only = self.settings:get_show_downloaded_only()
-    
-    local function close_dlg()
-        if UIHandles.get("sort_dialog") then
-            UIManager:close(UIHandles.get("sort_dialog"))
-            UIHandles.clear("sort_dialog")
-        end
-    end
-    
-    local function do_sort(sort_key)
-        close_dlg()
-        self.settings:set_shelf_sort(sort_key)
-        self.bookshelf:sort_books(true)
-        -- 重新渲染书架
-        if menu_instance and not menu_instance._reading_closed then
-            -- 这里直接更新传入的菜单实例并重建列表
-            UIManager:close(menu_instance)
-            self:show()
-        end
-    end
-
-    local function toggle_downloaded_only()
-        close_dlg()
-        self.settings:set_show_downloaded_only(not show_downloaded_only)
-        if menu_instance and not menu_instance._reading_closed then
-            UIManager:close(menu_instance)
-            self:show()
-        end
-    end
-
-    local function show_cloud_library()
-        close_dlg()
-        self:show_cloud_library(menu_instance)
-    end
-
-    local btns = {}
-    table.insert(btns, {
-        {
-            text = _("云端书库"),
-            callback = show_cloud_library,
-        }
-    })
-    table.insert(btns, {
-        {
-            text = _("仅显示已下载") .. (show_downloaded_only and "  ✓" or ""),
-            callback = toggle_downloaded_only,
-        }
-    })
-    table.insert(btns, {
-        {
-            text = _("按最后阅读") .. (current_sort == "last_read" and "  ✓" or ""),
-            callback = function() do_sort("last_read") end,
-        }
-    })
-    table.insert(btns, {
-        {
-            text = _("按更新时间") .. (current_sort == "latest_update" and "  ✓" or ""),
-            callback = function() do_sort("latest_update") end,
-        }
-    })
-    table.insert(btns, {
-        {
-            text = _("按书名") .. ((current_sort == "book_name" or current_sort == "title") and "  ✓" or ""),
-            callback = function() do_sort("book_name") end,
-        }
-    })
-    table.insert(btns, { { text = _("取消"), callback = close_dlg } })
-
-    local dlg = ButtonDialog:new{
-        title = _("菜单"),
-        title_align = "center",
-        align = "center",
-        buttons = btns,
-    }
-    
-    UIHandles.set("sort_dialog", dlg)
-    UIManager:show(dlg)
-end
-
-function ReadingPlugin:show_cloud_library(menu_instance)
-    self:showBusy(_("正在获取云端书库..."))
-    
-    local sync_ref = self.sync
-    local self_ref = self
-    self:_async_run(
-        function()
-            local ok, epub_files, err = sync_ref:list_books_directory()
-            if not ok then
-                return { ok = false, err = err }
-            end
-            return { ok = true, files = epub_files }
-        end,
-        function(ok, result, err)
-            self_ref:closeBusy()
-            if not ok or not result or not result.ok then
-                local err_msg = tostring(err or (result and result.err) or _("未知错误"))
-                self_ref:showInfo(_("获取云端书库失败:\n") .. err_msg)
-                return
-            end
-            ShelfView.show_cloud_library_list(result.files, function(file)
-                self_ref:download_cloud_book(file, menu_instance)
-            end)
-        end,
-        { timeout = 30 }
-    )
-end
-
-function ReadingPlugin:download_cloud_book(file, menu_instance)
-    local DownloadProgress = require("reading.download_progress")
-    
-    local progress = DownloadProgress:new{
-        title = _("下载书籍"),
-        on_cancel = function()
-            self._download_cancelled = true
-        end,
-    }
-    progress:show()
-    
-    UIManager:scheduleIn(0.1, self:_guard(_("下载书籍"), function()
-        if progress:isCanceled() then
-            progress:close()
-            return
-        end
-
-        progress:setState{ 
-            stage = "content", 
-            file = file.name,
-            current = 1,
-            total = 1,
-            percent = 0,
-            message = _("正在下载...") 
-        }
-
-        local books_dir = H.get_books_dir()
-        H.make_dir(books_dir)
-        local save_path = H.join_path(books_dir, file.name)
-
-        if H.file_exists(save_path) then
-            local local_size = H.get_file_size(save_path)
-            if local_size and file.size and local_size == file.size then
-                progress:setState{ stage = "done", message = _("文件已存在") }
-                UIManager:scheduleIn(1, function() 
-                    progress:close() 
-                    self:_ensure_book_in_shelf(file.name)
-                    if menu_instance and not menu_instance._reading_closed then
-                        UIManager:close(menu_instance)
-                        self:show()
-                    end
-                end)
-                return
-            end
-        end
-
-        local ok, __, err = self.sync:download_epub(file.path, save_path)
-        if ok then
-            progress:setState{ stage = "done", message = _("下载成功") }
-        else
-            progress:setState{ stage = "error", message = tostring(err) }
-        end
-
-        UIManager:scheduleIn(1.5, function() 
-            progress:close() 
-            if ok then
-                self:_ensure_book_in_shelf(file.name)
-                if menu_instance and not menu_instance._reading_closed then
-                    UIManager:close(menu_instance)
-                    self:show()
-                end
-            end
-        end)
-    end))
-end
-
-function ReadingPlugin:_ensure_book_in_shelf(filename)
-    local book_name = filename:gsub("%.epub$", ""):gsub("%.txt$", "")
-    
-    local existing = self.bookshelf:get_book_by_name(book_name)
-    if existing then return end
-    
-    local new_book = {
-        name = book_name,
-        author = "",
-        bookUrl = "local://" .. H.url_encode(book_name),
-        lastCheckTime = os.time() * 1000,
-        is_local_only = true
-    }
-    
-    table.insert(self.bookshelf.books, new_book)
-    self.bookshelf:rebuild_index()
-    self.bookshelf:save_bookshelf_cache()
-    Log.info("手动添加云端书籍到书架: " .. book_name)
-end
-
-function ReadingPlugin:perform_sync(url)
-    self:showBusy(_("正在同步..."))
-    local sync_ref = self.sync
-    local self_ref = self
-    self:_async_run(
-        function()
-            local ok, msg = sync_ref:sync_from_url(url)
-            if not ok then
-                return { ok = false, err = msg }
-            end
-            return { ok = true, data = sync_ref:get_sync_data() }
-        end,
-        function(ok, result, err)
-            self_ref:closeBusy()
-            if not ok or not result or not result.ok then
-                local err_msg = tostring(err or (result and result.err) or _("未知错误"))
-                self_ref:showInfo(_("同步失败: ") .. err_msg)
-                return
-            end
-            self_ref:_complete_sync(result.data)
-        end,
-        { timeout = 60 }
-    )
-end
-
-function ReadingPlugin:show_book_detail(book)
-    Context.set_current_book(book)
-
-    local epub_path = self.bookshelf:get_epub_for_book(book)
-    local has_local_epub = epub_path ~= nil
-
-    local local_size = 0
-    if has_local_epub then
-        local lfs = require("libs/libkoreader-lfs")
-        local attr = lfs.attributes(epub_path)
-        if attr then
-            local_size = attr.size or 0
-        end
-    end
-
-    local ButtonDialog = require("ui/widget/buttondialog")
-    local self_ref = self
-
-    local book_name = book.name or book.title or _("未命名")
-    local author_text = book.author or ""
-    local chapter_text = book.durChapterIndex and T(_("当前章节: 第 %1 章"), book.durChapterIndex + 1) or ""
-
-    local function build_info_text(status_text)
-        local result = book_name
-        if author_text ~= "" then
-            result = result .. "\n" .. author_text
-        end
-        if chapter_text ~= "" then
-            result = result .. "\n" .. chapter_text
-        end
-        if status_text ~= "" then
-            result = result .. "\n" .. status_text
-        end
-        return result
-    end
-
-    -- 提取按钮构建逻辑：每次调用都生成新的 callback 闭包，确保 reinit 后 callback 不丢失
-    local function build_buttons(pull_enabled, pull_text)
-        return {
-            {
-                {
-                    text = _("开始阅读"),
-                    enabled = true,
-                    callback = self_ref:_guard(_("开始阅读"), function()
-                        Log.info("点击开始阅读按钮, has_local_epub=" .. tostring(has_local_epub))
-                        Log.info("书籍信息: " .. (book.name or book.title or ""))
-                        UIManager:close(UIHandles.get("detail_dialog"))
-                        UIHandles.clear("detail_dialog")
-                        if UIHandles.get("menu") then
-                            UIManager:close(UIHandles.get("menu"))
-                            UIHandles.clear("menu")
-                        end
-                        self_ref:start_reading(book)
-                    end),
-                },
-                {
-                    text = pull_text or (has_local_epub and _("更新书籍") or _("拉取书籍")),
-                    enabled = pull_enabled or false,
-                    callback = self_ref:_guard(_("拉取书籍"), function()
-                        UIManager:close(UIHandles.get("detail_dialog"))
-                        UIHandles.clear("detail_dialog")
-                        self_ref:download_epub_for_book(book, has_local_epub)
-                    end),
-                },
-            },
-            {
-                {
-                    text = _("拉取进度"),
-                    callback = function()
-                        UIManager:close(UIHandles.get("detail_dialog"))
-                        UIHandles.clear("detail_dialog")
-                        self_ref:pull_cloud_progress()
-                    end,
-                },
-                {
-                    text = _("覆盖云端"),
-                    callback = function()
-                        UIManager:close(UIHandles.get("detail_dialog"))
-                        UIHandles.clear("detail_dialog")
-                        self_ref:push_cloud_progress()
-                    end,
-                },
-            },
-            {
-                {
-                    text = _("删除书籍"),
-                    callback = function()
-                        UIManager:close(UIHandles.get("detail_dialog"))
-                        UIHandles.clear("detail_dialog")
-                        self_ref:delete_book(book)
-                    end,
-                },
-            },
-            {
-                {
-                    text = _("查看简介"),
-                    callback = function()
-                        self_ref:show_book_intro(book)
-                    end,
-                },
-                {
-                    text = _("关闭"),
-                    callback = function()
-                        UIManager:close(UIHandles.get("detail_dialog"))
-                        UIHandles.clear("detail_dialog")
-                    end,
-                },
-            },
-        }
-    end
-
-    -- 关闭旧对话框并创建新对话框（替代 reinit，避免 callback 丢失）
-    local function show_detail_dialog(status_text, pull_enabled, pull_text)
-        local old_dlg = UIHandles.get("detail_dialog")
-        if old_dlg then
-            UIManager:close(old_dlg)
-        end
-
-        local new_dlg = ButtonDialog:new{
-            title = build_info_text(status_text),
-            title_align = "center",
-            buttons = build_buttons(pull_enabled, pull_text),
-        }
-        UIHandles.set("detail_dialog", new_dlg)
-        UIManager:show(new_dlg)
-    end
-
-    local function no_cloud_fallback()
-        local status = has_local_epub and _("[本地已下载]") or _("[云端无书籍，请在Legado中导出到legado/books目录]")
-        show_detail_dialog(status, false, nil)
-    end
-
-    -- 初始显示对话框（"开始阅读"按钮立即可用）
-    local initial_status = has_local_epub and T(_("[本地已下载: %1]"), H.format_file_size(local_size)) or _("[检查云端中...]")
-    show_detail_dialog(initial_status, false, nil)
-
-    -- 异步检查云端书籍，完成后用新对话框替换旧对话框（callback 正确绑定）
-    UIManager:scheduleIn(0.1, self:_guard(_("检查云端书籍"), function()
-        local ok, epub_files, err = self_ref.sync:list_books_directory()
-        if not ok then
-            Log.warn("列出云端书籍失败: " .. tostring(err))
-            no_cloud_fallback()
-            return
-        end
-
-        local book_name_for_match = book.name or book.title or ""
-        if book_name_for_match == "" then
-            no_cloud_fallback()
-            return
-        end
-
-        local matched_epub = self_ref.bookshelf:match_epub(book_name_for_match, epub_files, book.author)
-
-        local has_remote_epub = matched_epub ~= nil
-        local remote_epub_name = has_remote_epub and matched_epub.name or ""
-        local remote_size = has_remote_epub and (matched_epub.size or 0) or 0
-
-        Log.debug("更新对话框: has_remote_epub=" .. tostring(has_remote_epub) .. ", has_local_epub=" .. tostring(has_local_epub))
-
-        local status_text = ""
-        local pull_button_enabled = false
-        local pull_button_text = has_local_epub and _("更新书籍") or _("拉取书籍")
-
-        if has_remote_epub then
-            if has_local_epub then
-                -- 不用文件大小判断是否有更新：云端可能是不同章节范围的导出
-                -- （如之前导出1-300章，云端导出300-350章，文件更小但内容不同）
-                if remote_size > local_size then
-                    status_text = T(_("[本地: %1] [云端有更新: %2]"), H.format_file_size(local_size), H.format_file_size(remote_size))
-                elseif remote_size < local_size then
-                    status_text = T(_("[本地: %1] [云端文件不同: %2]"), H.format_file_size(local_size), H.format_file_size(remote_size))
-                else
-                    status_text = T(_("[本地: %1] [云端大小相同]"), H.format_file_size(local_size))
-                end
-                pull_button_enabled = true
-                pull_button_text = _("更新书籍")
-            else
-                status_text = T(_("[云端有书籍: %1 (%2)]"), remote_epub_name, H.format_file_size(remote_size))
-                pull_button_enabled = true
-                pull_button_text = _("拉取书籍")
-            end
-        else
-            if has_local_epub then
-                status_text = T(_("[本地已下载: %1]"), H.format_file_size(local_size))
-            else
-                status_text = _("[云端无书籍，请在Legado中导出到legado/books目录]")
-            end
-            pull_button_enabled = false
-        end
-
-        Log.debug("按钮状态: enabled=" .. tostring(pull_button_enabled) .. ", text=" .. pull_button_text)
-        show_detail_dialog(status_text, pull_button_enabled, pull_button_text)
-    end))
-end
-
-function ReadingPlugin:show_book_intro(book)
-    local intro = book.intro or book.desc or book.description
-    
-    if not intro or type(intro) ~= "string" or intro == "" then
-        intro = _("暂无简介")
-    end
-    
-    if intro:len() > 500 then
-        intro = intro:sub(1, 500) .. "..."
-    end
-    
-    -- UIManager:show 为第三方 UI 调用，用 Result.try 统一包装为 (ok, result, err)
-    local ok, __, err = Result.try(function()
-        UIManager:show(InfoMessage:new{
-            text = intro,
-            timeout = 0,
-        })
-    end, "显示简介")
-
-    if not ok then
-        UIManager:show(InfoMessage:new{
-            text = _("显示简介失败"),
-            timeout = 2,
-        })
-    end
-end
-
-function ReadingPlugin:delete_book(book)
-    local ConfirmBox = require("ui/widget/confirmbox")
-    local title = book.name or book.title or _("未命名")
-    
-    UIManager:show(ConfirmBox:new{
-        text = T(_("确定要删除《%1》的本地文件和缓存吗？\n\n这只会删除已下载的文件，书籍仍会保留在书架中。"), title),
-        ok_text = _("删除"),
-        ok_callback = function()
-            -- 1. 删除本地文件
-            local epub_path = self.bookshelf:get_epub_for_book(book)
-            if epub_path and H.file_exists(epub_path) then
-                os.remove(epub_path)
-                Log.info("已删除本地书籍文件: " .. epub_path)
-            end
-            
-            -- 2. 清理章节缓存（不再调用不存在的 remove_record）
-            local url = book.bookUrl or ""
-            if url ~= "" then
-                self.bookshelf:clear_book_cache(url)
-            end
-            
-            -- 3. 不从书架列表中移除书籍，这样非"仅显示已下载"视图中还能看到它
-            
-            self:showInfo(T(_("已删除《%1》的本地文件"), title))
-            
-            -- 4. 刷新书架视图 (使用 scheduleIn 避免在 Dialog callback 中直接操作 UI 导致闪退)
-            UIManager:scheduleIn(0.1, function()
-                local menu_instance = UIHandles.get("active_menu")
-                if menu_instance and not menu_instance._reading_closed then
-                    UIManager:close(menu_instance)
-                    self:show()
-                end
-            end)
-        end,
-    })
-end
-
-function ReadingPlugin:start_reading(book)
-    Log.info("开始阅读: " .. (book.name or book.title or ""))
-
-    local epub_path = self.bookshelf:get_epub_for_book(book)
-    Log.info("start_reading: get_epub_for_book 返回 = " .. tostring(epub_path))
-
-    if epub_path then
-        -- 校验文件真实存在，避免 showReader 静默失败
-        local lfs = require("libs/libkoreader-lfs")
-        local attr = lfs.attributes(epub_path)
-        if not attr or attr.mode ~= "file" then
-            Log.error("start_reading: 本地文件不存在或不可访问: " .. epub_path)
-            -- 缓存可能过期，失效后重试一次
-            self.bookshelf:invalidate_epub_cache()
-            epub_path = self.bookshelf:get_epub_for_book(book)
-            Log.info("start_reading: 失效缓存后重新查找 = " .. tostring(epub_path))
-            attr = epub_path and lfs.attributes(epub_path) or nil
-            if not epub_path or not attr or attr.mode ~= "file" then
-                self:showInfo(T(_("本地文件丢失，请重新下载《%1》"), book.name or book.title or ""))
-                return
-            end
-        end
-        Log.info("start_reading: 文件校验通过，大小=" .. tostring(attr.size) .. " 字节，准备打开: " .. epub_path)
-        self:open_epub_book(epub_path, book)
-    else
-        Log.info("start_reading: 本地未找到书籍，尝试从云端下载")
-        self:showInfo(T(_("本地无此书，正在从云端下载《%1》..."), book.name or book.title or ""))
-        UIManager:scheduleIn(0.5, function()
-            self:download_epub_for_book(book, false)
-        end)
-    end
-end
-
-function ReadingPlugin:open_book(book)
-    self:show_book_detail(book)
-end
-
-function ReadingPlugin:download_epub_for_book(book, force_overwrite)
-    force_overwrite = force_overwrite or false
-    if not book then return end
-
-    local book_name = book.name or book.title or ""
-    local book_author = book.author or ""
-    if book_name == "" then
-        self:showInfo(_("书籍名称为空"))
-        return
-    end
-
-    -- 取消之前的书籍下载任务，避免并发下载或回调混乱
-    if self._download_epub_handle then
-        self:_cancel_async(self._download_epub_handle)
-        self._download_epub_handle = nil
-    end
-
-    self:showBusy(force_overwrite and _("正在更新书籍...") or _("正在下载书籍..."))
-
-    local gen = Context.get_generation()
-    local books_dir = H.get_books_dir()
-    H.make_dir(books_dir)
-
-    local sync_ref = self.sync
-    local bookshelf_ref = self.bookshelf
-    local self_ref = self
-    local book_ref = book
-    local force_ref = force_overwrite
-
-    -- 整个 list + match + download 流程在子进程中执行，UI 不阻塞
-    self._download_epub_handle = self:_async_run(
-        function()
-            local ok, epub_files, err = sync_ref:list_books_directory()
-            if not ok then
-                return { ok = false, stage = "list", err = tostring(err) }
-            end
-            local matched_epub = bookshelf_ref:match_epub(book_name, epub_files, book_author)
-            if not matched_epub then
-                return { ok = false, stage = "match" }
-            end
-            local save_path = H.join_path(books_dir, matched_epub.name)
-            local ok2, _, result = sync_ref:download_epub(matched_epub.path, save_path, force_overwrite, matched_epub.size)
-            if not ok2 then
-                return { ok = false, stage = "download", err = tostring(result) }
-            end
-            return { ok = true, save_path = save_path, result = result }
-        end,
-        function(ok, result, err)
-            self_ref._download_epub_handle = nil
-            self_ref:closeBusy()
-            if not ok then
-                Log.error("EPUB下载异步失败: " .. tostring(err))
-                self_ref:showInfo(_("下载失败: ") .. tostring(err))
-                return
-            end
-            if not result.ok then
-                if result.stage == "match" then
-                    self_ref:showInfo(T(_("云端未找到书籍: %1\n请在Legado中导出到legado/books目录"), book_name))
-                elseif result.stage == "list" then
-                    self_ref:showInfo(_("查找书籍失败: ") .. tostring(result.err))
-                else
-                    self_ref:showInfo(_("下载失败: ") .. tostring(result.err))
-                end
-                return
-            end
-            Log.info("EPUB下载成功: " .. result.save_path)
-            if result.result == "skipped" then
-                self_ref:showInfo(_("文件未更新"))
-            else
-                self_ref.bookshelf:invalidate_epub_cache()
-                self_ref:showInfo(force_ref and _("更新完成") or _("下载完成"))
-                UIManager:scheduleIn(0.5, function()
-                    if Context.get_generation() ~= gen then
-                        Log.debug("download_epub_for_book: 阅读会话已变更，放弃打开书籍")
-                        return
-                    end
-                    self_ref:open_epub_book(result.save_path, book_ref)
-                end)
-            end
-        end,
-        { timeout = 120 }
-    )
-end
-
-function ReadingPlugin:open_epub_book(epub_path, book)
-    Context.set_current_book(book)
-    Context.set_current_epub_path(epub_path)
-
-    Log.info("open_epub_book: " .. epub_path)
-
-    local ReaderUI = require("apps/reader/readerui")
-    local Event = require("ui/event")
-    Log.info("open_epub_book: ReaderUI.instance = " .. tostring(ReaderUI.instance))
-    Log.info("open_epub_book: self.ui 类型 = " .. tostring(self.ui and self.ui.__ctype or "nil"))
-
-    local ok, err = pcall(function()
-        -- 不用 switchDocument（其内部先 onClose 再 showReader，中间 forceRePaint 会闪现书架，
-        -- 且旧实例的 onCloseDocument 会清掉刚设置的新书上下文与 pending_jump）。
-        -- 直接用 showReader：doShowReader 在 nextTick 中关闭旧实例并打开新实例，无闪现。
-        -- seamless=true 隐藏“打开文件”提示并避免全屏刷新。
-        if not ReaderUI.instance then
-            -- 通知 FileManager 标记 tearing_down（不立即关闭），优化后续刷新，
-            -- 与 cloudstorage/dictquicklookup 等内置模块的打开方式一致。
-            Log.info("open_epub_book: 广播 SetupShowReader 事件")
-            UIManager:broadcastEvent(Event:new("SetupShowReader"))
-        end
-        Log.info("open_epub_book: 调用 ReaderUI:showReader(" .. epub_path .. ", nil, true)")
-        ReaderUI:showReader(epub_path, nil, true)
-        Log.info("open_epub_book: showReader 调用完成")
-    end)
-    if not ok then
-        Log.error("open_epub_book 失败: " .. tostring(err))
-        self:showError(_("打开书籍"), err)
-    else
-        Log.info("open_epub_book: 流程正常结束")
-    end
-end
-
-function ReadingPlugin:_load_chapters_from_document(retry_count)
-    retry_count = retry_count or 0
-    local ReaderUI = require("apps/reader/readerui")
-    local reader = ReaderUI.instance
-
-    if not reader or not reader.document then
-        -- ReaderUI 尚未就绪，重试而不是直接返回（避免丢失 pending_jump）
-        if retry_count < 6 and Context.get_current_epub_path() then
-            Log.warn("_load_chapters_from_document: ReaderUI未就绪，0.5秒后重试 (" .. (retry_count + 1) .. "/6)")
-            UIManager:scheduleIn(0.5, self:_guard(_("加载章节"), function()
-                self:_load_chapters_from_document(retry_count + 1)
-            end))
-        else
-            Log.error("_load_chapters_from_document: ReaderUI实例或文档为空，放弃重试")
-            self:closeBusy()
-        end
-        return
-    end
-
-    local toc = reader.document:getToc()
-    if toc and #toc > 0 then
-        Context.set_current_chapters({})
-        for ___, entry in ipairs(toc) do
-            local title = entry.title or ""
-            table.insert(Context.get_current_chapters(), {
-                name = title,
-                -- 预处理并缓存 normalize 后的标题，优化查找效率
-                norm_name = title:gsub("%s+", ""),
-                xpointer = entry.xpointer or "",
-                page = entry.page or 1,
-            })
-        end
-        Log.info("加载目录完成，共 " .. #Context.get_current_chapters() .. " 章")
-    else
-        Log.warn("_load_chapters_from_document: 目录为空")
-        Context.set_current_chapters({})
-    end
-
-    if Context.get_pending_jump() then
-        Log.info("执行待处理的跳转: 第" .. Context.get_pending_jump().chapter_index .. "章, 位置: " .. Context.get_pending_jump().chapter_pos)
-        local legado_index = Context.get_pending_jump().chapter_index
-        local chapter_pos = Context.get_pending_jump().chapter_pos
-        local chapter_title = Context.get_pending_jump().chapter_title or ""
-        Context.set_pending_jump(nil)
-
-        if Context.get_current_chapters() and #Context.get_current_chapters() > 0 then
-            local jump_index = legado_index  -- 最终传给 read_chapter 的索引（Legado 基准）
-
-            -- 优先用章节标题匹配，解决 Legado 与 EPUB TOC 索引偏移（目录/简介等前置条目）
-            if chapter_title and chapter_title ~= "" then
-                local matched_epub_idx = self:_find_chapter_by_title(Context.get_current_chapters(), chapter_title)
-                if matched_epub_idx then
-                    -- 标题匹配到的是 EPUB TOC 1-based 索引，反推 Legado 0-based 索引
-                    -- legado_0based = epub_1based - toc_offset
-                    local book = Context.get_current_book()
-                    local offset = book and book.toc_offset or 1
-                    jump_index = math.max(0, matched_epub_idx - offset)
-                    Log.info("pending_jump 标题匹配: 云端第" .. legado_index .. "章 '" .. chapter_title .. "' -> EPUB TOC " .. matched_epub_idx .. " (offset=" .. offset .. ") -> Legado " .. jump_index)
-                else
-                    Log.warn("pending_jump 标题匹配失败，回退使用索引: 第" .. legado_index .. "章")
-                end
-            end
-
-            -- 最终跳转索引的边界保护（Legado 0-based：0 ~ totalChapters-1）
-            if jump_index < 0 then jump_index = 0 end
-            local offset_for_max = (Context.get_current_book() and Context.get_current_book().toc_offset) or 1
-            local max_legado = #Context.get_current_chapters() - offset_for_max  -- EPUB 总数 - offset = Legado 最大 0-based 索引
-            if jump_index > max_legado then jump_index = max_legado end
-
-            self:read_chapter(jump_index, chapter_pos)
-
-            -- 跳转完成后才显示成功消息
-            local book = Context.get_current_book()
-            local offset = book and book.toc_offset or 1
-            local jumped_epub_idx = jump_index + offset
-            if jumped_epub_idx < 1 then jumped_epub_idx = 1 end
-            if jumped_epub_idx > #Context.get_current_chapters() then
-                jumped_epub_idx = #Context.get_current_chapters()
-            end
-            local jumped_title = Context.get_current_chapters()[jumped_epub_idx].name or ""
-            self:showInfo(T(_("已跳转到第 %1 章 %2"), jump_index + 1, jumped_title))
-        else
-            Log.warn("_load_chapters_from_document: 目录为空，无法跳转")
-            self:showInfo(_("目录为空，无法跳转"))
-        end
-    end
-
-    self:closeBusy()
+    -- 【stale-while-revalidate】上面已经用本地缓存把书架画出来了（打开书架零等待），
+    -- 这里再判断缓存是否已陈旧，陈旧就在**后台**补一次同步，成功后原地换新数据。
+    -- 放在渲染之后：先让用户看到东西，再补网络 —— 顺序反过来就是「打开书架要等网络」。
+    self:_maybe_bg_revalidate_shelf(shelf_token)
 end
 
 
-
-function ReadingPlugin:show_chapter_list()
-    local book = Context.get_current_book()
-    local chapters = Context.get_current_chapters()
-
-    if not book then
-        self:showInfo(_("请先选择书籍"))
-        return
-    end
-    if not chapters or #chapters == 0 then
-        self:showInfo(_("目录未加载"))
-        return
-    end
-
-    -- book.durChapterIndex 是 Legado 0-based，ShelfView 用 Lua 1-based，需要 +1
-    local current_chapter_index = (book.durChapterIndex or 0) + 1
-
-    if current_chapter_index < 1 then
-        current_chapter_index = 1
-    end
-    if current_chapter_index > #chapters then
-        current_chapter_index = #chapters
-    end
-
-    UIHandles.set("chapter_list_menu", ShelfView.show_chapter_list(
-        chapters,
-        current_chapter_index,
-        function(index)
-            -- ShelfView 回调 index 是 Lua 1-based，read_chapter 期望 Legado 0-based，需要 -1
-            self:read_chapter(index - 1)
-        end,
-        function()
-            self:refresh_toc()
-        end,
-        book.name or book.title or "目录"
-    ))
-end
-
-function ReadingPlugin:refresh_toc()
-    if UIHandles.get("chapter_list_menu") then
-        UIManager:close(UIHandles.get("chapter_list_menu"))
-    end
-
-    local ReaderUI = require("apps/reader/readerui")
-    local reader = ReaderUI.instance
-    if not reader or not reader.document then
-        self:showInfo(_("请先打开书籍"))
-        return
-    end
-
-    -- 直接从当前文档重新加载目录，无需重开书籍。
-    -- 重开（open_epub_book）会触发 onCloseDocument，对同一本书会清理 current_book，导致进度同步失效。
-    self:_load_chapters_from_document()
-    self:show_chapter_list()
-end
-
-function ReadingPlugin:read_chapter(chapter_index, chapter_pos)
-    -- chapter_index: Legado 0-based 章节索引
-    chapter_pos = chapter_pos or 0
-
-    if UIHandles.get("chapter_list_menu") then
-        UIManager:close(UIHandles.get("chapter_list_menu"))
-    end
-
-    local book = Context.get_current_book()
-    local chapters = Context.get_current_chapters()
-
-    if not book then
-        self:showInfo(_("请先选择书籍"))
-        return
-    end
-    if not chapters or #chapters == 0 then
-        self:showInfo(_("目录未加载"))
-        return
-    end
-
-    -- 获取 TOC 偏移量：epub_1based = legado_0based + toc_offset
-    local ReaderUI = require("apps/reader/readerui")
-    local reader = ReaderUI.instance
-    local toc = reader and reader.document and reader.document:getToc() or nil
-    local toc_offset = self:_get_toc_offset(book, toc)
-
-    -- 转换为 EPUB TOC 1-based 索引（用于查 chapters 表和 toc 表）
-    local epub_index = chapter_index + toc_offset
-
-    -- 标题验证（反向）：从 Legado 章节列表获取标题，在 EPUB TOC 中查找
-    -- 处理"作者有话说""紧急求助"等动态插入导致偏移量失效的情况
-    local verified_epub = self:_verify_epub_index_by_title(book, chapter_index, toc or chapters)
-    if verified_epub then
-        epub_index = verified_epub
-    end
-
-    -- 边界保护（epub_index 是 1-based）
-    if epub_index < 1 then epub_index = 1 end
-    if epub_index > #chapters then epub_index = #chapters end
-
-    -- 反算合法的 Legado 索引（防止越界后数据不一致）
-    local legado_index = epub_index - toc_offset
-    if legado_index < 0 then legado_index = 0 end
-
-    Log.debug("read_chapter: Legado " .. chapter_index .. " + offset " .. toc_offset .. " = EPUB " .. epub_index)
-
-    -- 用 EPUB 1-based 索引查 chapters 表
-    Context.set_current_chapter_index(epub_index)
-    local chapter = chapters[epub_index]
-
-    -- 存入 book 的是 Legado 0-based 索引（与 Legado App 一致）
-    book.durChapterIndex = legado_index
-    book.durChapterTitle = chapter.name
-    book.durChapterPos = chapter_pos
-    book.lastCheckTime = os.time()
-
-    self.read_record:update_record(
-        book.bookUrl,
-        book.name or book.title or "",
-        0,
-        os.time() * 1000
-    )
-
-    if reader and reader.document then
-        local doc = reader.document
-        if toc and toc[epub_index] then
-            local chapter_start_page = doc:getPageFromXPointer(toc[epub_index].xpointer)
-            if not chapter_start_page then
-                -- 回退：xpointer 无效时使用 TOC 中记录的页码
-                chapter_start_page = toc[epub_index].page
-                Log.warn("无法从 xpointer 获取页码，回退使用 TOC 页码: " .. tostring(chapter_start_page))
-            end
-            if chapter_start_page then
-                local target_page = chapter_start_page
-
-                if chapter_pos > 0 then
-                    local total_pages = doc:getPageCount()
-                    if total_pages and total_pages > 0 then
-                        local current_start = toc[epub_index].page or chapter_start_page
-                        local next_start = (epub_index < #toc) and (toc[epub_index + 1].page or total_pages + 1) or (total_pages + 1)
-                        local chapter_pages = next_start - current_start
-                        if chapter_pages > 0 then
-                            local offset_pages = math.floor((chapter_pos / 1000) * chapter_pages)
-                            target_page = chapter_start_page + offset_pages
-                        end
-                    end
-                end
-
-                Log.info("跳转到页面: " .. target_page)
-                -- 必须通过 GotoPage 事件走 ReaderRolling/ReaderPaging 的导航逻辑，
-                -- 其内部会更新 view.state 并广播 PageUpdate/PosUpdate 刷新视图；
-                -- 直接调 doc:gotoPage 只改文档内部页码，画面不会刷新。
-                local Event = require("ui/event")
-                reader:handleEvent(Event:new("GotoPage", target_page))
-            else
-                Log.warn("无法获取章节起始页面: EPUB TOC=" .. epub_index)
-                self:showInfo(T(_("无法跳转到第 %1 章"), legado_index + 1))
-            end
-        else
-            Log.warn("目录为空或章节索引无效: EPUB TOC=" .. epub_index)
-            self:showInfo(T(_("无法跳转到第 %1 章"), legado_index + 1))
-        end
-    else
-        Log.warn("ReaderUI实例或文档为空")
-        self:showInfo(_("请先打开书籍"))
-    end
-end
-
-
-
-
-
-function ReadingPlugin:_auto_pull_and_compare()
-    if not self.settings:is_progress_auto_sync_enabled() then return end
-    local book = Context.get_current_book()
-    if not book then return end
-
-    local book_name = book.name or book.title or ""
-    local book_author = book.author or ""
-    if book_name == "" then return end
-
-    -- 捕获 generation 令牌，异步回调执行时校验，防止切书后旧回调上传旧书进度
-    local gen = Context.get_generation()
-
-    Log.info("自动拉取云端进度进行对比: " .. book_name)
-
-    UIManager:scheduleIn(0.5, self:_guard(_("自动拉取云端进度"), function()
-        -- 令牌校验：若期间切换了书籍，放弃本次回调
-        if Context.get_generation() ~= gen then
-            Log.debug("自动拉取: 阅读会话已变更，放弃")
-            return
-        end
-
-        local sync_ref = self.sync
-        local self_ref = self
-
-        -- get_book_progress 在子进程中执行，不阻塞 UI
-        self:_async_run(
-            function()
-                local ok, progress_data, err = sync_ref:get_book_progress(book_name, book_author)
-                return { ok = ok, data = progress_data, err = err }
-            end,
-            function(ok, result, err)
-                if not ok then
-                    Log.warn("自动拉取云端进度异步失败: " .. tostring(err))
-                    return
-                end
-                if not result or not result.ok then
-                    Log.warn("自动拉取云端进度失败: " .. tostring(result and result.err or err))
-                    return
-                end
-                if not result.data then
-                    Log.debug("自动拉取: 云端无进度数据")
-                    return
-                end
-                -- silent=true: 自动对比时非"云端超前"不显示提示
-                self_ref:_handle_pulled_progress(book, result.data, gen, true)
-            end,
-            { timeout = 30 }
-        )
-    end))
-end
-
-function ReadingPlugin:save_read_progress(chapter_index)
-    local book = Context.get_current_book()
-    if not book or not Context.get_current_epub_path() then return end
-
-    local refresh_ok = self:_refresh_current_progress()
-    if not refresh_ok then
-        Log.warn("save_read_progress: 无法刷新当前进度（document 不可用），使用上次记录的进度")
-    end
-    local book_name = book.name or book.title or ""
-    local book_author = book.author or ""
-    local chapter_index_val = book.durChapterIndex or 0
-    local chapter_pos_val = book.durChapterPos or 0
-    local chapter_title_val = book.durChapterTitle or ""
-    
-    Log.debug("自动保存进度: " .. book_name .. " 章节 " .. chapter_index_val .. " 位置 " .. chapter_pos_val)
-
-    local gen = Context.get_generation()
-    local sync_ref = self.sync
-    self:_async_run(
-        function()
-            local ok, _, err = sync_ref:upload_book_progress(
-                book_name, book_author, chapter_index_val, chapter_pos_val, chapter_title_val
-            )
-            return { ok = ok, err = err }
-        end,
-        function(ok, result, err)
-            if Context.get_generation() ~= gen then
-                Log.debug("save_read_progress: 阅读会话已变更，放弃回调")
-                return
-            end
-            if ok and result and result.ok then
-                Log.debug("自动上传进度成功: " .. book_name)
-            else
-                Log.warn("自动上传进度失败: " .. book_name .. ", " .. tostring(err or (result and result.err)))
-            end
-        end,
-        { timeout = 30 }
-    )
-end
-
-function ReadingPlugin:pull_cloud_progress()
-    if not Context.get_current_book() then return end
-
-    -- 捕获 generation 令牌，异步回调执行时校验
-    local gen = Context.get_generation()
-
-    self:showBusy(_("正在拉取云端进度..."))
-
-    UIManager:scheduleIn(0.1, self:_guard(_("拉取云端进度"), function()
-        if Context.get_generation() ~= gen then
-            Log.debug("拉取云端进度: 阅读会话已变更，放弃")
-            self:closeBusy()
-            return
-        end
-
-        local book = Context.get_current_book()
-        if not book then
-            self:closeBusy()
-            return
-        end
-        local book_name = book.name or book.title or ""
-        local book_author = book.author or ""
-
-        Log.info("手动拉取云端进度: " .. book_name)
-
-        local sync_ref = self.sync
-        local self_ref = self
-
-        -- get_book_progress 在子进程中执行，不阻塞 UI
-        self:_async_run(
-            function()
-                local ok, progress_data, err = sync_ref:get_book_progress(book_name, book_author)
-                return { ok = ok, data = progress_data, err = err }
-            end,
-            function(ok, result, err)
-                self_ref:closeBusy()
-                if not ok then
-                    Log.warn("拉取进度异步失败: " .. tostring(err))
-                    self_ref:showInfo(T(_("拉取进度失败:\n%1"), err))
-                    return
-                end
-                if not result or not result.ok then
-                    self_ref:showInfo(T(_("拉取进度失败:\n%1"), result and result.err or err))
-                    return
-                end
-                if not result.data then
-                    self_ref:showInfo(_("云端没有该书的进度"))
-                    return
-                end
-                self_ref:_handle_pulled_progress(book, result.data, gen)
-            end,
-            { timeout = 30 }
-        )
-    end))
-end
-
---- 处理拉取到的云端进度：对比本地进度并提示用户（从 pull_cloud_progress 提取，便于复用）
---- @param silent boolean|nil  true 时非"云端超前"情况不显示提示（自动对比用）
-function ReadingPlugin:_handle_pulled_progress(book, progress_data, gen, silent)
-    if not book or not progress_data then return end
-    if gen and Context.get_generation() ~= gen then
-        Log.debug("_handle_pulled_progress: 阅读会话已变更，放弃")
-        return
-    end
-
-    local remote_record = {
-        durChapterIndex = progress_data.durChapterIndex or 0,
-        durChapterPos = progress_data.durChapterPos or 0,
-        durChapterTitle = progress_data.durChapterTitle or "",
-        durChapterTime = progress_data.durChapterTime or 0,
-    }
-
-    -- 刷新本地进度，同时取出 EPUB TOC 1-based 索引用于标题对齐对比
-    local _, local_epub_idx = self:_refresh_current_progress()
-    local local_chapter_index = book.durChapterIndex or 0   -- Legado 0-based，用于展示
-    local local_chapter_pos = book.durChapterPos or 0
-
-    Log.debug("本地进度: 第" .. (local_chapter_index + 1) .. "章(0based=" .. local_chapter_index ..
-             ", EPUB=" .. tostring(local_epub_idx) .. "), 位置: " .. local_chapter_pos)
-    Log.debug("云端进度: 第" .. ((remote_record.durChapterIndex or 0) + 1) ..
-             "章(0based=" .. (remote_record.durChapterIndex or 0) .. "), 位置: " .. remote_record.durChapterPos ..
-             ", 标题: " .. (remote_record.durChapterTitle or ""))
-
-    -- 对比走标题对齐：优先用云端 durChapterTitle 在本地 EPUB TOC 匹配，
-    -- 反推偏移量并持久化，供后续上传/跳转链路复用
-    local compare_result, derived_offset = self:_compare_progress_by_title(book, local_epub_idx, remote_record)
-
-    -- 持久化校准出的偏移量，并同步更新内存缓存
-    if derived_offset then
-        if book.bookUrl and book.bookUrl ~= "" then
-            self.bookshelf:save_toc_offset(book.bookUrl, derived_offset, remote_record.durChapterTitle or "")
-        end
-        book.toc_offset = derived_offset
-    end
-
-    if compare_result == "remote_ahead" then
-        local ButtonDialog = require("ui/widget/buttondialog")
-
-        local info_text = T(_("云端进度更靠前") .. "\n\n" ..
-            _("本地进度: 第%1章 %2") .. "\n" ..
-            _("云端进度: 第%3章 %4"),
-            local_chapter_index + 1,
-            book.durChapterTitle or "",
-            (remote_record.durChapterIndex or 0) + 1,
-            remote_record.durChapterTitle or ""
-        )
-
-        local self_ref = self
-        local dialog = ButtonDialog:new{
-            title = _("进度同步"),
-            info_text = info_text,
-            buttons = {
-                {
-                    {
-                        text = _("跳转到云端进度"),
-                        callback = function()
-                            UIManager:close(dialog)
-                            self_ref:_jump_to_cloud_progress(remote_record)
-                        end,
-                    },
-                    {
-                        text = _("保持本地进度"),
-                        callback = function()
-                            UIManager:close(dialog)
-                            self_ref:showInfo(_("保持本地进度"))
-                        end,
-                    },
-                },
-            },
-        }
-        UIManager:show(dialog)
-    elseif compare_result == "same" then
-        if not silent then
-            self:showInfo(_("进度一致，无需跳转"))
-        end
-    else
-        if not silent then
-            self:showInfo(T(_("本地进度超前，云端进度: 第%1章 %2"),
-                (remote_record.durChapterIndex or 0) + 1,
-                remote_record.durChapterTitle or ""))
-        end
-    end
-end
-
-function ReadingPlugin:_compare_progress(local_chapter, local_pos, remote_chapter, remote_pos)
-    local_chapter = local_chapter or 0
-    local_pos = local_pos or 0
-    remote_chapter = remote_chapter or 0
-    remote_pos = remote_pos or 0
-
-    -- 章节不同时，直接以章节为准判断进度先后
-    -- 注意：Legado durChapterIndex 是 0-based，数值越大表示越靠后
-    if local_chapter > remote_chapter then
-        return "local_ahead"
-    elseif local_chapter < remote_chapter then
-        return "remote_ahead"
-    else
-        -- 同章时：由于 Legado App 和 KOReader 的 durChapterPos 计算方式/单位可能不一致
-        -- （Legado 可能用页码或不同比例，KOReader 用 0-1000 千分比），
-        -- 直接数值比较会产生误判。同章视为进度一致，不触发跳转。
-        -- 只有章节不同才有可靠的对齐基准（章节标题 + 索引）。
-        return "same"
-    end
-end
-
---- 通过标题对齐对比本地与云端进度，并反推校准偏移量
--- 优先用云端 durChapterTitle 在本地 EPUB TOC 中匹配章节索引，
--- 跟本地当前 EPUB TOC 索引比较；同时通过 (matched_epub_idx - cloud_legado_idx)
--- 反推出偏移量，返回给调用方持久化，供后续上传/跳转链路复用。
---
--- 核心映射公式（统一完整导出和部分导出场景）：
---   offset = remote_epub_idx - remote_legado_idx   （允许负数）
---   上传：local_legado = local_epub - offset
---   跳转：local_epub  = legado + offset
---
--- 完整导出：offset 为前置条目数（正数，如 3）
--- 部分导出（多卷只导后几卷）：offset 为负数（如 6 - 865 = -859），
---   此时 local_epub - offset = local_epub + 859，正确反推出全书索引。
--- 只要本地 EPUB 章节是连续的（按卷导出即满足），线性映射就成立。
---
--- @param book table              当前书籍对象
--- @param local_epub_idx number   本地当前 EPUB TOC 1-based 索引（由 _refresh_current_progress 返回）
--- @param remote_record table     { durChapterIndex, durChapterPos, durChapterTitle }
--- @return result string          "local_ahead" | "remote_ahead" | "same"
--- @return derived_offset|nil     标题匹配命中时反推的偏移量（可为负数）；nil 表示未命中不持久化
-function ReadingPlugin:_compare_progress_by_title(book, local_epub_idx, remote_record)
-    if not book or not remote_record then return "same", nil end
-
-    local doc_toc = Context.get_current_chapters() or {}
-    local remote_title = remote_record.durChapterTitle or ""
-    local remote_legado_idx = tonumber(remote_record.durChapterIndex) or 0
-    local local_epub = tonumber(local_epub_idx) or 0
-
-    -- 1. 优先：云端标题在本地 EPUB TOC 匹配
-    if remote_title ~= "" and #doc_toc > 0 then
-        local remote_epub_idx = self:_find_chapter_by_title(doc_toc, remote_title)
-        if remote_epub_idx then
-            -- 反推偏移量（允许负数）：offset = epub_1based - legado_0based
-            -- 完整导出为正（前置条目数），部分导出为负（起始章节全书索引 - 前置数）
-            local derived_offset = remote_epub_idx - remote_legado_idx
-
-            -- 对比结论：local_epub_idx 与 remote_epub_idx 都是本地 EPUB TOC 索引基准，可直接比较
-            local result
-            if local_epub > remote_epub_idx then
-                result = "local_ahead"
-            elseif local_epub < remote_epub_idx then
-                result = "remote_ahead"
-            else
-                result = "same"
-            end
-
-            Log.info("标题对齐对比: 本地EPUB=" .. local_epub ..
-                     ", 云端EPUB=" .. remote_epub_idx ..
-                     " (云端第" .. remote_legado_idx .. "章 '" .. remote_title ..
-                     "' → offset=" .. derived_offset .. ") → " .. result)
-            return result, derived_offset
-        else
-            Log.warn("标题对齐: 云端标题 '" .. remote_title .. "' 在本地 EPUB TOC 未匹配，回退数值对比")
-        end
-    end
-
-    -- 2. 回退：用持久化偏移量把本地 EPUB 索引转 Legado，再数值对比
-    local stored_offset = nil
-    if book.bookUrl and book.bookUrl ~= "" then
-        stored_offset = self.bookshelf:load_toc_offset(book.bookUrl)
-    end
-    local offset = stored_offset or book.toc_offset or 1
-    local local_legado = local_epub - offset
-    if local_legado < 0 then local_legado = 0 end
-
-    local result
-    if local_legado > remote_legado_idx then
-        result = "local_ahead"
-    elseif local_legado < remote_legado_idx then
-        result = "remote_ahead"
-    else
-        result = "same"
-    end
-
-    Log.info("数值对比回退: 本地EPUB=" .. local_epub .. " - offset=" .. offset ..
-             " = Legado=" .. local_legado ..
-             ", 云端Legado=" .. remote_legado_idx .. " → " .. result ..
-             (stored_offset and " (用持久化offset)" or " (用内存offset)"))
-    return result, nil
-end
-
-function ReadingPlugin:_refresh_current_progress()
-    local book = Context.get_current_book()
-    if not book then return false, nil, nil, nil end
-    if not self.ui or not self.ui.document then return false, nil, nil, nil end
-
-    local doc = self.ui.document
-    local total_pages = doc:getPageCount()
-    if not total_pages or total_pages <= 0 then return false, nil, nil, nil end
-
-    local toc = doc:getToc()
-    if not toc or #toc == 0 then
-        local current_page = doc:getCurrentPage() or 1
-        local progress_percent = current_page / total_pages
-        book.durChapterPos = math.floor(progress_percent * 1000)
-        return true, nil, nil, nil  -- 无 TOC，无法返回章节索引
-    end
-
-    local current_page = doc:getCurrentPage() or 1
-    local chapter_index = #toc
-    local chapter_pos = 1000
-
-    local left, right = 1, #toc
-    while left <= right do
-        local mid = math.floor((left + right) / 2)
-        local current_start = toc[mid].page or 1
-        local next_start = (mid < #toc) and (toc[mid + 1].page or total_pages + 1) or (total_pages + 1)
-
-        if current_page >= current_start and current_page < next_start then
-            chapter_index = mid
-            local chapter_pages = next_start - current_start
-            if chapter_pages > 0 then
-                chapter_pos = math.floor((current_page - current_start) / chapter_pages * 1000)
-            else
-                chapter_pos = 0
-            end
-            Context.set_chapter_range_cache({
-                start_page = current_start,
-                end_page = next_start,
-                chapter_index = chapter_index,
-                chapter_title = toc[chapter_index] and toc[chapter_index].title or "",
-            })
-            break
-        elseif current_page < current_start then
-            right = mid - 1
-        else
-            left = mid + 1
-        end
-    end
-
-    -- 从 EPUB TOC 索引转换为 Legado 章节索引
-    -- 注意：Legado durChapterIndex 是 0-based（Book.kt L97 默认 0，L166 lastChapterIndex=totalChapterNum-1）
-    local toc_offset = self:_get_toc_offset(book, toc)
-    local legado_index = chapter_index - toc_offset
-    local legado_title = toc[chapter_index] and toc[chapter_index].title or ""
-
-    -- 标题验证：用 EPUB TOC 当前章节标题在 Legado 章节列表中查找，
-    -- 处理"作者有话说""紧急求助"等动态插入导致偏移量失效的情况
-    local verified_index = self:_verify_legado_index_by_title(book, legado_title, legado_index)
-    if verified_index then
-        legado_index = verified_index
-    elseif legado_index < 0 then
-        -- 落在 TOC 前置条目（封面/内容简介），用 Legado 第1章（索引0）兜底
-        legado_index = 0
-    end
-
-    -- 上界保护：负 offset（部分导出场景）下 legado_index 会较大，
-    -- 避免异常 offset 导致上传超出全书范围的索引
-    local total = tonumber(book.totalChapterNum) or 0
-    if total > 0 and legado_index >= total then
-        Log.warn("legado_index " .. legado_index .. " 超出 totalChapterNum " .. total .. "，钳制为 " .. (total - 1))
-        legado_index = total - 1
-    end
-
-    book.durChapterIndex = legado_index
-    book.durChapterPos = chapter_pos
-    book.durChapterTitle = legado_title
-    book.toc_offset = toc_offset
-
-    Log.debug("强制刷新进度: TOC=" .. chapter_index .. " - offset=" .. toc_offset .. " = Legado=" .. legado_index .. "章, 位置=" .. chapter_pos)
-    -- 多返回值：ok, epub_idx(1-based), legado_idx(0-based), chapter_title
-    -- 旧调用点 `local ok = ...` 只取第一个返回值，兼容不变
-    return true, chapter_index, legado_index, legado_title
-end
-
---- 通过标题验证 Legado 章节索引是否正确
--- 处理"作者有话说""紧急求助"等动态插入导致固定偏移量失效的情况。
--- 用 EPUB TOC 当前章节标题在 Legado 章节列表中查找，如果找到且索引不一致，用匹配到的索引。
--- @param book table  当前书籍对象
--- @param title string EPUB TOC 当前章节标题
--- @param fallback_index number 偏移量计算的 Legado 索引（0-based）
--- @return number|nil  验证后的 Legado 索引（0-based），nil 表示无法验证（用 fallback）
-function ReadingPlugin:_verify_legado_index_by_title(book, title, fallback_index)
-    if not title or title == "" then return nil end
-
-    -- 加载 Legado 原始章节列表
-    local book_url = book.bookUrl or ""
-    if book_url == "" then return nil end
-    local legado_chapters = self.bookshelf:load_toc_cache(book_url)
-    if not legado_chapters or #legado_chapters == 0 then return nil end
-
-    -- 在 Legado 章节列表中查找标题匹配
-    local matched_idx = self:_find_chapter_by_title(legado_chapters, title)
-    if not matched_idx then return nil end
-
-    -- matched_idx 是 Lua 1-based，转为 Legado 0-based
-    local verified_legado = matched_idx - 1
-
-    if verified_legado ~= fallback_index then
-        Log.info("标题验证(EPUB→Legado): 偏移量计算=" .. fallback_index .. ", 标题匹配=" .. verified_legado ..
-                 "（标题 '" .. title .. "' 可能因动态插入导致偏移失效，采用标题匹配结果）")
-    end
-    return verified_legado
-end
-
---- 通过标题验证 EPUB TOC 索引是否正确（反向：Legado → EPUB）
--- 处理"作者有话说""紧急求助"等动态插入导致固定偏移量失效的情况。
--- 从 Legado 章节列表获取指定索引的标题，在 EPUB TOC 中查找对应位置。
--- @param book table  当前书籍对象
--- @param legado_index number Legado 0-based 章节索引
--- @param doc_toc table  EPUB TOC（1-based Lua 表）
--- @return number|nil  验证后的 EPUB TOC 索引（1-based），nil 表示无法验证（用 fallback）
-function ReadingPlugin:_verify_epub_index_by_title(book, legado_index, doc_toc)
-    if not doc_toc or #doc_toc == 0 then return nil end
-
-    -- 加载 Legado 原始章节列表
-    local book_url = book.bookUrl or ""
-    if book_url == "" then return nil end
-    local legado_chapters = self.bookshelf:load_toc_cache(book_url)
-    if not legado_chapters or #legado_chapters == 0 then return nil end
-
-    -- 获取 Legado 章节标题（legado_index 是 0-based，转 1-based 查表）
-    local legado_1based = legado_index + 1
-    if legado_1based < 1 or legado_1based > #legado_chapters then return nil end
-    local legado_ch = legado_chapters[legado_1based]
-    local title = legado_ch and (legado_ch.name or legado_ch.title) or ""
-    if title == "" then return nil end
-
-    -- 在 EPUB TOC 中查找标题匹配
-    local matched_epub = self:_find_chapter_by_title(doc_toc, title)
-    if not matched_epub then return nil end
-
-    Log.debug("标题验证(Legado→EPUB): Legado " .. legado_index .. " '" .. title .. "' -> EPUB TOC " .. matched_epub)
-    return matched_epub
-end
-
---- 计算 EPUB TOC 与 Legado 章节列表的偏移量
--- 统一公式: epub_1based_index = legado_0based_index + toc_offset
---   - epub_1based_index: EPUB TOC 的 Lua 1-based 索引
---   - legado_0based_index: Legado durChapterIndex（0-based，Book.kt L97 默认 0）
---   - toc_offset: 本函数计算的偏移量
---
--- Legado 导出 EPUB 时固定在正文前插入 2 个前置条目：
---   1. "封面" (R.string.img_cover) / "Cover"
---   2. "内容简介" (R.string.book_intro) / "Book description"
--- 参考: legado/app/src/main/java/io/legado/app/service/ExportBookService.kt L483-506
--- 结果缓存到 book.toc_offset，避免重复计算。
-function ReadingPlugin:_calc_toc_offset(book, doc_toc)
-    if not book or not doc_toc or #doc_toc == 0 then
-        return 1  -- 无前置时，epub_1based = legado_0based + 1
-    end
-
-    -- 1. 第一优先级：检测 Legado 导出 EPUB 的固定前置条目（封面 + 内容简介）
-    --    参考: ExportBookService.kt L483-506, strings.xml L236/L269
-    local legado_prefix_titles = {
-        "封面", "Cover",
-        "内容简介", "Book description",
-        "简介", "Intro",
-        "目录", "Contents", "Table of Contents",
-    }
-    local first_real_chapter_idx = nil
-    for i = 1, math.min(5, #doc_toc) do
-        local title = doc_toc[i] and doc_toc[i].title or ""
-        local is_prefix = false
-        for __, pat in ipairs(legado_prefix_titles) do
-            if title == pat or title:find(pat, 1, true) then
-                is_prefix = true
-                break
-            end
-        end
-        if not is_prefix then
-            first_real_chapter_idx = i
-            break
-        end
-    end
-    if first_real_chapter_idx then
-        -- EPUB TOC[first_real_chapter_idx] = Legado durChapterIndex=0（正文第1章）
-        -- epub_1based = legado_0based + offset → offset = first_real_chapter_idx - 0 = first_real_chapter_idx
-        local offset = first_real_chapter_idx
-        Log.info("_calc_toc_offset: 检测到 Legado 前置条目，首章 TOC=" .. first_real_chapter_idx .. ", 偏移=" .. offset)
-        return offset
-    end
-
-    -- 2. 第二优先级：用当前 book.durChapterTitle 在 EPUB TOC 中匹配
-    local legado_chapters = nil
-    local book_url = book.bookUrl or ""
-    if book_url ~= "" then
-        legado_chapters = self.bookshelf:load_toc_cache(book_url)
-    end
-
-    local probe_title = book.durChapterTitle or ""
-    -- durChapterIndex 是 0-based，Legado 章节列表是 1-based（Lua），需要 +1
-    if probe_title == "" and book.durChapterIndex and legado_chapters then
-        local legado_idx = book.durChapterIndex + 1  -- 0-based 转 1-based
-        if legado_idx >= 1 and legado_idx <= #legado_chapters then
-            local legado_ch = legado_chapters[legado_idx]
-            if legado_ch then
-                probe_title = legado_ch.name or legado_ch.title or ""
-            end
-        end
-    end
-
-    if probe_title and probe_title ~= "" then
-        local matched_idx = self:_find_chapter_by_title(doc_toc, probe_title)
-        if matched_idx then
-            -- matched_idx 是 Lua 1-based EPUB TOC 索引
-            -- book.durChapterIndex 是 0-based Legado 索引
-            -- epub_1based = legado_0based + offset → offset = matched_idx - legado_0based
-            local legado_base = book.durChapterIndex or 0
-            local offset = matched_idx - legado_base
-            if offset < 1 then offset = 1 end
-            Log.info("_calc_toc_offset: 标题 '" .. probe_title .. "' 匹配 TOC " .. matched_idx .. " = Legado " .. legado_base .. ", 偏移=" .. offset)
-            return offset
-        end
-    end
-
-    -- 3. 第三优先级：Legado 章节列表前3章 vs EPUB TOC
-    if legado_chapters and #legado_chapters > 0 then
-        local probe_count = math.min(3, #legado_chapters)
-        for li = 1, probe_count do
-            local legado_name = legado_chapters[li] and (legado_chapters[li].name or legado_chapters[li].title) or ""
-            if legado_name ~= "" then
-                local epub_idx = self:_find_chapter_by_title(doc_toc, legado_name)
-                if epub_idx then
-                    -- epub_idx 是 Lua 1-based，li 是 Lua 1-based（对应 Legado 0-based 的 li-1）
-                    -- epub_1based = legado_0based + offset = (li - 1) + offset
-                    -- offset = epub_idx - (li - 1) = epub_idx - li + 1
-                    local offset = epub_idx - li + 1
-                    if offset < 1 then offset = 1 end
-                    Log.info("_calc_toc_offset: Legado 第" .. li .. "章 '" .. legado_name .. "' = TOC " .. epub_idx .. ", 偏移=" .. offset)
-                    return offset
-                end
-            end
-        end
-    end
-
-    -- 4. 第四优先级：默认偏移 3（Legado 导出 EPUB：封面 + 内容简介 + Lua 1-based 基准）
-    Log.warn("_calc_toc_offset: 无法精确匹配，使用 Legado 默认偏移 3（封面+内容简介+1based）")
-    return 3
-end
-
---- 获取并缓存 TOC 偏移量（存在 book 对象上，同一次阅读会话复用）
--- 优先级：内存 book.toc_offset > 持久化偏移量（标题对齐校准过）> _calc_toc_offset 现算
--- 持久化偏移由 _handle_pulled_progress 通过标题对齐反推并写入，
--- 比关键词匹配/默认值更可靠，能修正"作者有话说/紧急求助"等动态插入导致的漂移
-function ReadingPlugin:_get_toc_offset(book, doc_toc)
-    if not book then return 1 end  -- 无 book 时最小偏移（Lua 1-based 基准）
-    if book.toc_offset == nil then
-        -- 优先复用持久化偏移（标题对齐校准过的更可靠）
-        local stored = nil
-        if book.bookUrl and book.bookUrl ~= "" then
-            stored = self.bookshelf:load_toc_offset(book.bookUrl)
-        end
-        if stored then
-            book.toc_offset = stored
-            Log.debug("_get_toc_offset: 复用持久化偏移 " .. stored)
-        else
-            book.toc_offset = self:_calc_toc_offset(book, doc_toc)
-        end
-    end
-    return book.toc_offset
-end
-
---- 通过标题在章节列表中查找章节索引（解决 Legado 与 EPUB TOC 索引偏移问题）
--- Legado 章节列表与 EPUB TOC 可能因"目录""简介"等前置条目导致索引不一致，
--- 用标题匹配可精确定位，避免差 1~N 章的跳转偏差。
--- @param chapters table  章节列表（Context.get_current_chapters()）
--- @param title string    目标章节标题（来自云端 durChapterTitle）
--- @return number|nil     匹配到的索引，nil 表示未找到
-function ReadingPlugin:_find_chapter_by_title(chapters, title)
-    if not chapters or #chapters == 0 then return nil end
-    if not title or title == "" then return nil end
-
-    -- 兼容 EPUB TOC（title/norm_name 字段）和 Legado 章节列表（name/title 字段）
-    local get_name = function(ch)
-        return ch and (ch.name or ch.title) or ""
-    end
-
-    -- 1. 精确匹配
-    for i, ch in ipairs(chapters) do
-        if get_name(ch) == title then
-            Log.debug("_find_chapter_by_title: 精确匹配: '" .. title .. "' -> 第" .. i .. "章")
-            return i
-        end
-    end
-
-    -- 2. 去空格匹配（标题可能因 EPUB/Legado 解析差异导致空格不同）
-    local norm_title = type(title) == "string" and title:gsub("%s+", "") or ""
-    if norm_title ~= "" then
-        for i, ch in ipairs(chapters) do
-            -- 如果有预处理好的 norm_name，直接使用，否则实时计算并缓存
-            local ch_norm = ch.norm_name
-            if not ch_norm then
-                ch_norm = get_name(ch):gsub("%s+", "")
-                ch.norm_name = ch_norm
-            end
-            
-            if ch_norm == norm_title then
-                Log.debug("_find_chapter_by_title: 去空格匹配: '" .. title .. "' -> 第" .. i .. "章 (" .. get_name(ch) .. ")")
-                return i
-            end
-        end
-
-        -- 3. 子串匹配（一方包含另一方，处理标题前后缀差异）
-        for i, ch in ipairs(chapters) do
-            local norm_ch = ch.norm_name
-            if not norm_ch then
-                norm_ch = get_name(ch):gsub("%s+", "")
-                ch.norm_name = norm_ch
-            end
-            
-            if norm_ch ~= "" and (norm_ch:find(norm_title, 1, true) or norm_title:find(norm_ch, 1, true)) then
-                Log.debug("_find_chapter_by_title: 子串匹配: '" .. title .. "' -> 第" .. i .. "章 (" .. get_name(ch) .. ")")
-                return i
-            end
-        end
-    end
-
-    Log.warn("_find_chapter_by_title: 未找到匹配章节: '" .. title .. "'")
-    return nil
-end
-
-function ReadingPlugin:_jump_to_cloud_progress(remote_record)
-    local legado_index = remote_record.durChapterIndex or 1
-    local chapter_pos = remote_record.durChapterPos or 0
-    local chapter_title = remote_record.durChapterTitle or ""
-
-    if not Context.get_current_book() then
-        Log.error("_jump_to_cloud_progress: 当前没有选中的书籍")
-        self:showInfo(_("请先选择书籍"))
-        return
-    end
-
-    local epub_path = self.bookshelf:get_epub_for_book(Context.get_current_book())
-    if not epub_path then
-        Log.error("_jump_to_cloud_progress: 未找到本地书籍文件")
-        self:showInfo(_("未找到本地书籍文件"))
-        return
-    end
-
-    local ReaderUI = require("apps/reader/readerui")
-    local reader = ReaderUI.instance
-
-    if not reader or not reader.document then
-        -- 书籍未打开：设置 pending_jump（含标题），打开书籍后由 _load_chapters_from_document 执行跳转
-        Log.info("_jump_to_cloud_progress: 书籍未打开，先打开书籍，跳转将延后执行")
-        Context.set_pending_jump({
-            chapter_index = legado_index,
-            chapter_pos = chapter_pos,
-            chapter_title = chapter_title,
-        })
-        -- 成功消息由 _load_chapters_from_document 在跳转完成后显示
-        self:open_epub_book(epub_path, Context.get_current_book())
-    else
-        if Context.get_current_chapters() and #Context.get_current_chapters() > 0 then
-            local jump_index = legado_index  -- 最终传给 read_chapter 的索引（Legado 基准）
-
-            -- 优先用章节标题匹配，解决 Legado 与 EPUB TOC 索引偏移（目录/简介等前置条目）
-            if chapter_title and chapter_title ~= "" then
-                local matched_epub_idx = self:_find_chapter_by_title(Context.get_current_chapters(), chapter_title)
-                if matched_epub_idx then
-                    -- 标题匹配到的是 EPUB TOC 1-based 索引，反推 Legado 0-based 索引
-                    -- legado_0based = epub_1based - toc_offset
-                    local book = Context.get_current_book()
-                    local offset = book and book.toc_offset or 1
-                    jump_index = math.max(0, matched_epub_idx - offset)
-                    Log.info("标题匹配: 云端第" .. legado_index .. "章 '" .. chapter_title .. "' -> EPUB TOC " .. matched_epub_idx .. " (offset=" .. offset .. ") -> Legado " .. jump_index)
-                else
-                    Log.warn("标题匹配失败，回退使用云端索引: 第" .. legado_index .. "章")
-                end
-            end
-
-            if jump_index < 0 then
-                jump_index = 0
-            end
-            local offset_for_max = (Context.get_current_book() and Context.get_current_book().toc_offset) or 1
-            local max_legado = #Context.get_current_chapters() - offset_for_max
-            if jump_index > max_legado then
-                jump_index = max_legado
-            end
-
-            Log.info("跳转到云端进度: 第" .. jump_index .. "章, 位置: " .. chapter_pos)
-
-            self:read_chapter(jump_index, chapter_pos)
-
-            -- 跳转完成后显示成功消息
-            local book = Context.get_current_book()
-            local offset = book and book.toc_offset or 1
-            local jumped_epub_idx = jump_index + offset
-            if jumped_epub_idx < 1 then jumped_epub_idx = 1 end
-            if jumped_epub_idx > #Context.get_current_chapters() then
-                jumped_epub_idx = #Context.get_current_chapters()
-            end
-            local jumped_title = Context.get_current_chapters()[jumped_epub_idx].name or ""
-            self:showInfo(T(_("已跳转到第 %1 章 %2"), jump_index + 1, jumped_title))
-        else
-            -- 目录未加载：设置 pending_jump（含标题），加载完成后执行跳转
-            Log.info("_jump_to_cloud_progress: 目录未加载完成，等待加载")
-            Context.set_pending_jump({
-                chapter_index = legado_index,
-                chapter_pos = chapter_pos,
-                chapter_title = chapter_title,
-            })
-            self:showBusy(_("正在加载目录..."))
-            self:_load_chapters_from_document()
-        end
-    end
-end
-
-function ReadingPlugin:push_cloud_progress()
-    if not Context.get_current_book() then
-        self:showInfo(_("请先选择书籍"))
-        return
-    end
-
-    self:_refresh_current_progress()
-
-    local book = Context.get_current_book()
-    local chapter_index = book.durChapterIndex or (Context.get_current_chapter_index() or 0)
-    local chapter_pos = book.durChapterPos or 0
-    local chapter_title = book.durChapterTitle or ""
-
-    local ConfirmBox = require("ui/widget/confirmbox")
-    UIManager:show(ConfirmBox:new{
-        text = T(_("确认覆盖云端进度？\n\n本地进度: 第%1章 %2"), chapter_index + 1, chapter_title),
-        ok_text = _("确认覆盖"),
-        cancel_text = _("取消"),
-        callback = function()
-            self:showBusy(_("正在上传进度..."))
-
-            local gen = Context.get_generation()
-            local sync_ref = self.sync
-            local self_ref = self
-            self:_async_run(
-                function()
-                    local ok, _, err = sync_ref:upload_book_progress(
-                        book.name or book.title or "",
-                        book.author or "",
-                        chapter_index, chapter_pos, chapter_title
-                    )
-                    return { ok = ok, err = err }
-                end,
-                function(ok, result, err)
-                    if Context.get_generation() ~= gen then
-                        self_ref:closeBusy()
-                        Log.debug("push_cloud_progress: 阅读会话已变更，放弃回调")
-                        return
-                    end
-                    self_ref:closeBusy()
-                    if ok and result and result.ok then
-                        self_ref:showInfo(_("进度已上传到云端"))
-                    else
-                        self_ref:showInfo(T(_("上传失败: %1"), err or (result and result.err)))
-                    end
-                end,
-                { timeout = 30 }
-            )
-        end,
-    })
-end
-
-function ReadingPlugin:next_chapter()
-    if not Context.get_current_chapters() or #Context.get_current_chapters() == 0 then
-        self:showInfo(_("目录未加载"))
-        return
-    end
-
-    local book = Context.get_current_book()
-    if not book then return end
-    -- book.durChapterIndex 是 Legado 0-based，+1 得到下一章
-    local next_legado = (book.durChapterIndex or 0) + 1
-    local toc_offset = book.toc_offset or 1
-    -- 转换为 EPUB 1-based 检查边界
-    local next_epub = next_legado + toc_offset
-    if next_epub <= #Context.get_current_chapters() then
-        self:read_chapter(next_legado)
-    else
-        self:showInfo(_("已经是最后一章"))
-    end
-end
-
-function ReadingPlugin:prev_chapter()
-    if not Context.get_current_chapters() or #Context.get_current_chapters() == 0 then
-        self:showInfo(_("目录未加载"))
-        return
-    end
-
-    local book = Context.get_current_book()
-    if not book then return end
-    -- book.durChapterIndex 是 Legado 0-based，-1 得到上一章
-    local prev_legado = (book.durChapterIndex or 0) - 1
-    if prev_legado >= 0 then
-        self:read_chapter(prev_legado)
-    else
-        self:showInfo(_("已经是第一章"))
-    end
-end
-
-function ReadingPlugin:sync_epub_files()
-    local DownloadProgress = require("reading.download_progress")
-    
-    local progress = DownloadProgress:new{
-        title = _("同步书籍"),
-        on_cancel = function()
-            self._download_cancelled = true
-        end,
-    }
-    progress:show()
-    
-    UIManager:scheduleIn(0.1, self:_guard(_("批量下载书籍"), function()
-        if progress:isCanceled() then
-            progress:close()
-            return
-        end
-
-        progress:setState{ stage = "prepare", message = _("正在获取书籍列表...") }
-
-        local ok, epub_files, err = self.sync:list_books_directory()
-        if not ok then
-            progress:setState{ stage = "error", message = tostring(err) }
-            UIManager:scheduleIn(2, function() progress:close() end)
-            return
-        end
-
-        local total = #epub_files
-        if total == 0 then
-            progress:setState{ stage = "done", message = _("云端没有书籍") }
-            UIManager:scheduleIn(2, function() progress:close() end)
-            return
-        end
-
-        Log.info("云端找到 " .. total .. " 个EPUB文件")
-
-        local books_dir = H.get_books_dir()
-        H.make_dir(books_dir)
-
-        local downloaded_count = 0
-        local skipped_count = 0
-        local failed_count = 0
-        local current = 0
-
-        local download_next
-        download_next = self:_guard(_("下载下一本"), function()
-            if progress:isCanceled() then
-                progress:setState{ stage = "cancelled" }
-                UIManager:scheduleIn(1, function() progress:close() end)
-                return
-            end
-
-            current = current + 1
-            if current > total then
-                progress:setState{
-                    stage = "done",
-                    message = T(_("同步完成\n下载: %1\n已存在: %2\n失败: %3"), downloaded_count, skipped_count, failed_count)
-                }
-                UIManager:scheduleIn(2, function() progress:close() end)
-                return
-            end
-
-            local epub = epub_files[current]
-            progress:setState{
-                stage = "content",
-                file = epub.name,
-                current = current,
-                total = total,
-                percent = current / total,
-                message = _("正在下载...")
-            }
-
-            local save_path = H.join_path(books_dir, epub.name)
-
-            if H.file_exists(save_path) then
-                local local_size = H.get_file_size(save_path)
-                local remote_size = epub.size
-                if local_size and remote_size and local_size == remote_size then
-                    skipped_count = skipped_count + 1
-                    Log.debug("文件已存在且大小一致，跳过: " .. epub.name)
-                    UIManager:scheduleIn(0.1, download_next)
-                    return
-                else
-                    Log.info("文件大小不一致，重新下载: " .. epub.name ..
-                        " (本地: " .. tostring(local_size) ..
-                        ", 云端: " .. tostring(remote_size) .. ")")
-                end
-            end
-
-            -- download_epub 返回 (ok, save_path, err)：失败时 err 在第三返回值
-            local ok2, __, err = self.sync:download_epub(epub.path, save_path)
-            if ok2 then
-                downloaded_count = downloaded_count + 1
-                Log.info("下载成功: " .. epub.name)
-            else
-                failed_count = failed_count + 1
-                Log.error("下载失败: " .. epub.name .. ", 错误: " .. tostring(err))
-            end
-
-            UIManager:scheduleIn(0.1, download_next)
-        end)
-
-        self.bookshelf:invalidate_epub_cache()
-        download_next()
-    end))
-end
-
-function ReadingPlugin:view_log()
-    local content, err = Log.read_log_content(5000)
-    if content then
-        UIManager:show(InfoMessage:new{
-            text = content,
-            timeout = 0,
-        })
-    else
-        self:showInfo(T(_("查看日志失败: %1"), err))
-    end
-end
-
-function ReadingPlugin:onClose()
-    -- 清理所有未完成的异步任务，防止插件关闭后回调仍被触发
-    self:_cancel_async()
-    
-    -- 一次性关闭所有 UI 句柄（含 menu、detail_dialog、active_menu、busy_msg、chapter_list_menu）
-    -- 修复原 _state 中 current_chapter_list_menu 在 onClose 未被清理的泄漏 bug
-    UIHandles.close_all()
-end
-
-function ReadingPlugin:onCloseWidget()
-    self:onClose()
-end
-
-function ReadingPlugin:onCloseDocument()
-    if not self.ui or not self.ui.document then return end
-
-    -- 以“正在关闭的文档”自身路径为准判断，不依赖可能已被切书覆盖的 Context
-    local closing_doc_path = self.ui.document.file or self.ui.document.path or ""
-    if closing_doc_path == "" then return end
-
-    local books_dir = H.get_books_dir()
-    -- 只处理 reading 插件目录下的书籍
-    if closing_doc_path:lower():sub(1, books_dir:lower():len()) ~= books_dir:lower() then
-        return
-    end
-
-    -- 清理章节变化追踪状态（定时器机制已移除，改为章节变化触发上传）
-    self._last_synced_chapter = nil
-
-    -- 切书场景：open_epub_book 已把 Context 指向新书，此时旧文档关闭，
-    -- 不应上传新书进度、更不能 clear_reading_context（否则丢失新书的 current_book 与 pending_jump）。
-    local ctx_path = Context.get_current_epub_path()
-    local is_switching = ctx_path ~= nil
-        and ctx_path:lower() ~= closing_doc_path:lower()
-
-    if is_switching then
-        Log.info("onCloseDocument: 检测到切书（上下文已指向新书 " .. tostring(ctx_path) .. "），跳过上传与清理")
-        return
-    end
-
-    if not ctx_path then return end
-
-    Log.info("阅读界面关闭，保存进度: " .. closing_doc_path)
-
-    -- 更新阅读记录并刷新进度，然后通过 Context.snapshot_progress() 捕获快照（含 generation 令牌）
-    local book = Context.get_current_book()
-    if book then
-        book.lastCheckTime = os.time()
-        self.read_record:update_record(
-            book.bookUrl,
-            book.name or book.title or "",
-            0,
-            os.time() * 1000
-        )
-        self:_refresh_current_progress()
-        -- 持久化 lastCheckTime 到书架缓存，确保书架排序能反映最近阅读时间
-        self.bookshelf:save_bookshelf_cache(self.bookshelf:get_books())
-    end
-
-    -- 使用快照数据上传，不依赖 Context 全局状态（清理后仍可安全上传）
-    local snapshot = Context.snapshot_progress()
-    if snapshot then
-        local gen = snapshot.generation
-        UIManager:scheduleIn(0.1, self:_guard(_("关闭文档保存进度"), function()
-            -- 令牌校验：若关闭后又打开了新书籍，放弃旧快照上传
-            if Context.get_generation() ~= gen then
-                Log.debug("关闭文档上传: 阅读会话已变更，放弃旧快照")
-                return
-            end
-            local ok, __, err = self.sync:upload_book_progress(
-                snapshot.name,
-                snapshot.author,
-                snapshot.durChapterIndex,
-                snapshot.durChapterPos,
-                snapshot.durChapterTitle
-            )
-            if ok then
-                Log.info("关闭文档时自动上传进度成功: " .. snapshot.name)
-            else
-                Log.warn("关闭文档时自动上传进度失败: " .. snapshot.name .. ", " .. tostring(err))
-            end
-        end))
-    end
-
-    -- 统一清理阅读上下文（generation 不重置，旧异步回调仍能识别过期）
-    Context.clear_reading_context()
-end
-
-function ReadingPlugin:onPageUpdate(pageno)
-    if not Context.get_current_epub_path() then return end
-
-    if not self.ui or not self.ui.document then return end
-
-    local book = Context.get_current_book()
-    if not book then return end
-
-    local doc = self.ui.document
-    local total_pages = doc:getPageCount()
-    if not total_pages or total_pages <= 0 then return end
-
-    local toc = doc:getToc()
-    if toc and #toc > 0 then
-        local cache = Context.get_chapter_range_cache()
-        -- 获取 TOC 偏移量（EPUB 前置条目导致的偏差，用于 Legado <-> EPUB 索引互转）
-        local toc_offset = self:_get_toc_offset(book, toc)
-
-        -- 快速路径：页码在缓存的章节范围内，O(1) 计算位置
-        if cache and pageno >= cache.start_page and pageno < cache.end_page then
-            local chapter_pages = cache.end_page - cache.start_page
-            local chapter_pos = 0
-            if chapter_pages > 0 then
-                chapter_pos = math.floor((pageno - cache.start_page) / chapter_pages * 1000)
-            end
-            -- EPUB TOC 索引减去偏移量得到 Legado 章节索引（0-based）
-            local legado_index = cache.chapter_index - toc_offset
-            if legado_index < 0 then legado_index = 0 end
-            book.durChapterIndex = legado_index
-            book.durChapterPos = chapter_pos
-            book.durChapterTitle = cache.chapter_title
-            book.toc_offset = toc_offset
-        else
-            -- 慢路径：跨章了，扫描 TOC 找到新章节
-            local chapter_index = #toc
-            local chapter_pos = 1000
-            local chapter_title = ""
-
-            local left, right = 1, #toc
-            while left <= right do
-                local mid = math.floor((left + right) / 2)
-                local current_start = toc[mid].page or 1
-                local next_start = (mid < #toc) and (toc[mid + 1].page or total_pages + 1) or (total_pages + 1)
-
-                if pageno >= current_start and pageno < next_start then
-                    chapter_index = mid
-                    chapter_title = toc[mid] and toc[mid].title or ""
-                    local chapter_pages = next_start - current_start
-                    if chapter_pages > 0 then
-                        chapter_pos = math.floor((pageno - current_start) / chapter_pages * 1000)
-                    else
-                        chapter_pos = 0
-                    end
-
-                    -- 更新缓存（存 EPUB 原生索引 + 原生标题）
-                    Context.set_chapter_range_cache({
-                        start_page = current_start,
-                        end_page = next_start,
-                        chapter_index = chapter_index,
-                        chapter_title = chapter_title,
-                    })
-                    break
-                elseif pageno < current_start then
-                    right = mid - 1
-                else
-                    left = mid + 1
-                end
-            end
-
-            -- EPUB TOC 索引减去偏移量得到 Legado 章节索引（0-based）
-            local legado_index = chapter_index - toc_offset
-            -- 标题验证：处理"作者有话说"等动态插入导致偏移量失效
-            local verified_index = self:_verify_legado_index_by_title(book, chapter_title, legado_index)
-            if verified_index then
-                legado_index = verified_index
-            elseif legado_index < 0 then
-                legado_index = 0
-            end
-            book.durChapterIndex = legado_index
-            book.durChapterPos = chapter_pos
-            book.durChapterTitle = chapter_title
-            book.toc_offset = toc_offset
-            -- 跨章时更新 lastCheckTime 并持久化到书架缓存（确保书架排序反映最近阅读时间）
-            book.lastCheckTime = os.time()
-            self.bookshelf:save_bookshelf_cache(self.bookshelf:get_books())
-        end
-    else
-        local progress_percent = pageno / total_pages
-        book.durChapterPos = math.floor(progress_percent * 1000)
-    end
-
-    -- 章节变化时异步上传进度（替代原定时器机制）
-    -- 仅在 durChapterIndex 发生变化且自动同步开启时触发，避免同章内重复上传
-    local current_chapter = book.durChapterIndex
-    if current_chapter ~= self._last_synced_chapter then
-        self._last_synced_chapter = current_chapter
-        if self.settings:is_progress_auto_sync_enabled() then
-            Log.debug("章节变化触发异步上传: " .. tostring(self._last_synced_chapter) .. " -> " .. tostring(current_chapter))
-            self:save_read_progress(current_chapter)
-        end
-    end
-end
-
-function ReadingPlugin:addToMainMenu(menu_items)
-    menu_items.reading = {
-        text = _("开源阅读"),
-        sorting_hint = "tools",
-        sub_item_table_func = function()
-            return self:getMainMenuItems()
-        end,
-    }
-end
-
-function ReadingPlugin:getMainMenuItems()
-    local items = {
-        {
-            text = _("书架"),
-            callback = self:_guard(_("书架"), function()
-                self:show()
-            end),
-        },
-        {
-            text = _("快捷同步"),
-            callback = self:_guard(_("快捷同步"), function()
-                self:sync_from_webdav_auto()
-            end),
-        },
-    }
-    
-    if self:isCurrentDocReading() then
-        table.insert(items, {
-            text = _("阅读进度"),
-            sub_item_table_func = function()
-                return self:getReadingProgressMenuItems()
-            end,
-        })
-    end
-    
-    table.insert(items, {
-        text = _("设置"),
-        sub_item_table_func = function()
-            return self:getSettingsMenuItems()
-        end,
-    })
-    
-    table.insert(items, {
-        text = _("调试日志"),
-        sub_item_table_func = function()
-            return self:getLogMenuItems()
-        end,
-    })
-    
-    table.insert(items, {
-        text = _("关于"),
-        callback = self:_guard(_("关于"), function()
-            UIManager:show(InfoMessage:new{
-                text = T(_("开源阅读插件 v%1\n\n在 KOReader 中阅读网络小说，支持书架同步、书源解析和阅读进度同步。"), self.version),
-            })
-        end),
-    })
-    
-    return items
-end
-
-function ReadingPlugin:getReadingProgressMenuItems()
-    local auto_sync_enabled = self.settings:is_progress_auto_sync_enabled()
-    return {
-        {
-            text = auto_sync_enabled and _("自动同步: 开启") or _("自动同步: 关闭"),
-            checked_func = function()
-                return auto_sync_enabled
-            end,
-            callback = self:_guard(_("切换自动同步"), function()
-                local new_val = not auto_sync_enabled
-                self.settings:set_progress_auto_sync_enabled(new_val)
-                if new_val then
-                    self:showInfo(_("自动同步已开启（章节变化时上传）"))
-                else
-                    self:showInfo(_("自动同步已关闭"))
-                end
-            end),
-        },
-        {
-            text = _("手动同步"),
-            separator = true,
-        },
-        {
-            text = _("拉取云端进度"),
-            callback = self:_guard(_("拉取云端进度"), function()
-                self:pull_cloud_progress()
-            end),
-        },
-        {
-            text = _("覆盖云端进度"),
-            callback = self:_guard(_("覆盖云端进度"), function()
-                self:push_cloud_progress()
-            end),
-        },
-        {
-            text = _("显示目录"),
-            callback = self:_guard(_("显示目录"), function()
-                self:show_chapter_list()
-            end),
-        },
-        {
-            text = _("刷新目录"),
-            callback = self:_guard(_("刷新目录"), function()
-                self:refresh_toc()
-            end),
-        },
-    }
-end
 
 return ReadingPlugin

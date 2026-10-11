@@ -7,7 +7,7 @@
     设计要点：
     - set(name, widget) 注册同名句柄时自动关闭旧句柄，避免重复 UI 残留。
     - close(name) 用 pcall 包裹 UIManager:close，防御性处理已销毁的 widget。
-    - close_all() 用于 onClose；close_all_except_busy() 用于需要保留 busy 提示的场景。
+    - close_all() 用于 onClose。
 ]]
 
 local Log = require("reading.log")
@@ -15,12 +15,20 @@ local Log = require("reading.log")
 local UIHandles = {}
 
 -- 模块级私有句柄表
+-- 下表只是**清单**（Lua 表不预声明也能工作），列出当前实际在用的句柄名 ——
+-- 新增句柄时请一并登记，否则这份清单会慢慢变成一份错误的文档。
+-- 注：active_menu 已删除 —— 它与 menu 永远同指同一个 widget，
+--     导致旧菜单在「打开书架」时被 close 两次。
 local _handles = {
     menu = nil,                  -- 书架主菜单
     detail_dialog = nil,         -- 书籍详情对话框
-    active_menu = nil,           -- 当前活跃的次要菜单
     busy_msg = nil,              -- busy 提示
     chapter_list_menu = nil,     -- 章节列表菜单（修复原 _state 泄漏）
+    sort_dialog = nil,           -- 书架排序/筛选对话框
+    webdav_file_list = nil,      -- WebDAV 备份文件列表
+    cloud_library_list = nil,    -- 云端书库 / 多版本选择列表
+    cloud_list_menu = nil,       -- 云端书库左上角菜单（排序/筛选）
+    progress_dialog = nil,       -- 「进度同步」选择框
 }
 
 -------------------------------------------------------------------------------
@@ -75,17 +83,6 @@ end
 function UIHandles.close_all()
     for name in pairs(_handles) do
         UIHandles.close(name)
-    end
-end
-
--------------------------------------------------------------------------------
--- 关闭除 busy_msg 外的所有句柄（需要保留 busy 提示的场景）
--------------------------------------------------------------------------------
-function UIHandles.close_all_except_busy()
-    for name in pairs(_handles) do
-        if name ~= "busy_msg" then
-            UIHandles.close(name)
-        end
     end
 end
 

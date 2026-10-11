@@ -30,6 +30,17 @@ local function clamp(v, lo, hi)
     return v
 end
 
+-- stage → 显示文案 的常量表。
+-- 原来它写在 setState 内部、每次调用都重建一遍，而 setState 被父进程按 1Hz 轮询反复调用。
+local STAGE_LABELS = {
+    prepare = _("准备下载"),
+    catalog = _("读取目录"),
+    content = _("获取章节正文"),
+    done = _("下载完成"),
+    error = _("下载失败"),
+    cancelled = _("下载已取消"),
+}
+
 function DownloadProgress:init()
     self.dimen = Screen:getSize()
     self.cancelled = false
@@ -142,14 +153,7 @@ function DownloadProgress:setState(state)
     end
     percent = clamp(percent, 0, 1)
 
-    local labels = {
-        prepare = _("准备下载"),
-        catalog = _("读取目录"),
-        content = _("获取章节正文"),
-        done = _("下载完成"),
-        error = _("下载失败"),
-        cancelled = _("下载已取消"),
-    }
+    local labels = STAGE_LABELS
     local rows = {}
     rows[#rows + 1] = labels[state.stage] or tostring(state.stage or _("处理中"))
     if total > 0 then rows[#rows + 1] = string.format(_("%d / %d"), current, total) end

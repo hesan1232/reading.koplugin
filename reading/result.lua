@@ -10,8 +10,6 @@
     - false, nil,   err   —— 失败带错误信息
 ]]
 
-local Log = require("reading.log")
-
 local Result = {}
 
 -------------------------------------------------------------------------------
@@ -25,26 +23,6 @@ function Result.format_error(err)
         return text:sub(1, 500) .. "..."
     end
     return text
-end
-
--------------------------------------------------------------------------------
--- 包装"不遵守约定的第三方/KOReader API"，捕获异常转为 (ok, result, err)
--- 用于调用 lfs.attributes、json.decode、socket.request 等
---
--- @param fn    无参闭包，返回单一值（或 nil）
--- @param label 可选，用于日志标识
--- @return ok, result, err
--------------------------------------------------------------------------------
-function Result.try(fn, label)
-    local ok, ret = xpcall(fn, function(err) return tostring(err) end)
-    if ok then
-        return true, ret, nil
-    end
-    local err = Result.format_error(ret)
-    if label then
-        Log.error(label .. " 异常: " .. err)
-    end
-    return false, nil, err
 end
 
 return Result

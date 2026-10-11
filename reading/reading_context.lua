@@ -36,6 +36,16 @@ function Context.get_current_book()
 end
 
 function Context.set_current_book(book)
+    -- 换书时章节范围缓存必然失效，必须清掉。
+    --
+    -- 这个缓存是「当前页 → 章节」的快速路径（onPageUpdate 命中它就不扫 TOC），
+    -- 内容全是**上一本书**的 start_page / end_page / chapter_index。
+    -- 唯一原本的清理点是 clear_reading_context()，但它在「切书」路径上走不到 ——
+    -- lifecycle.lua 的 onCloseDocument 一检测到 is_switching 就提前 return 了。
+    -- 后果：打开新书后若当前页恰好落在旧书的页区间内（恢复上次阅读页很容易命中），
+    -- 快速路径就会拿**旧书的 chapter_index 去索引新书的 toc**，把错误的章节索引与
+    -- 标题写进 book.durChapterIndex/durChapterTitle，随后被当作正常进度上传到云端。
+    _ctx.chapter_range_cache = nil
     _ctx.current_book = book
     if book then
         _generation = _generation + 1
